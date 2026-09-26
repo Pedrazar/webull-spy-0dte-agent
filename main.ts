@@ -4,7 +4,7 @@
  * Strategy:
  *   - At 10:30am ET (one hour after the open), read SPY's price and buy
  *     SPY_CONTRACTS of the same-day-expiring CALL whose strike is nearest to
- *     (price - SPY_STRIKE_OFFSET), i.e. ~$2 in the money.
+ *     (price - SPY_STRIKE_OFFSET), i.e. ~$1 in the money.
  *   - Watch it every POLL_MS. Close it if its mid price falls to
  *     (1 - SPY_STOP_LOSS_PCT) x the entry price (50% loss), or at 15
  *     minutes before the close (3:45pm ET; 12:45pm on half-days), whichever
@@ -37,7 +37,7 @@ import { logEvent, readState, writeState, DayState } from "./tradeLogger";
 
 const SYMBOL = "SPY";
 const CONTRACTS = parseInt(process.env.SPY_CONTRACTS ?? "1", 10);
-const STRIKE_OFFSET = parseFloat(process.env.SPY_STRIKE_OFFSET ?? "2");
+const STRIKE_OFFSET = parseFloat(process.env.SPY_STRIKE_OFFSET ?? "1");
 const STOP_LOSS_PCT = parseFloat(process.env.SPY_STOP_LOSS_PCT ?? "0.50");
 const POLL_MS = parseInt(process.env.SPY_POLL_MS ?? "15000", 10);
 

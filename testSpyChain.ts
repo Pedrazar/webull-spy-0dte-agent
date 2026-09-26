@@ -39,7 +39,7 @@ async function run() {
   console.log(`chain for ${expiry}: ${chain.length} contracts, expirations:`, [...new Set(chain.map((c) => c.expiration_date))]);
   console.log("sample contract:", chain[0]);
 
-  const target = price - 2;
+  const target = price - parseFloat(process.env.SPY_STRIKE_OFFSET ?? "1");
   const contract = pickStrikeNearest(chain.filter((c) => c.expiration_date === expiry), target);
   console.log(`target strike ${target.toFixed(2)} -> picked`, contract?.symbol, contract?.strike_price);
   if (!contract) return;

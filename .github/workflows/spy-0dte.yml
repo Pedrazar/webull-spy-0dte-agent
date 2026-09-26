@@ -40,7 +40,7 @@ jobs:
           WEBULL_BASE_URL: ${{ secrets.WEBULL_BASE_URL }}
           WEBULL_SANDBOX_ACCOUNT_ID: ${{ secrets.WEBULL_SANDBOX_ACCOUNT_ID }}
           SPY_CONTRACTS: "1"
-          SPY_STRIKE_OFFSET: "2"
+          SPY_STRIKE_OFFSET: "1"
           SPY_STOP_LOSS_PCT: "0.50"
         run: npx tsx main.ts
 

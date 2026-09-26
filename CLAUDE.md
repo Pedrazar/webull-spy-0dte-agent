@@ -15,7 +15,7 @@ Every trading day, one entry, one exit:
 
 - **10:30am ET** (one hour after the open): read SPY's last 1-min bar close,
   buy `SPY_CONTRACTS` (1) of the **CALL expiring today** whose strike is
-  nearest to `price - SPY_STRIKE_OFFSET` ($2), i.e. ~$2 in the money. The
+  nearest to `price - SPY_STRIKE_OFFSET` ($1), i.e. ~$1 in the money. The
   order is a LIMIT at the ask, with one retry at a fresh ask.
 - **Stop**: close if the option's mid falls to `(1 - SPY_STOP_LOSS_PCT)` x
   entry (50% loss), checked every `SPY_POLL_MS` (15s).
@@ -85,3 +85,9 @@ id on 2026-09-26 and answered "Order not present", so the request shape is
 accepted), SELL_TO_CLOSE, the positions shape for a long call (the wheel only
 confirmed a short put), and the full Actions run. The first trading day is
 the test, so watch that run.
+
+## Change log
+
+- **2026-09-26: strike offset $2 -> $1** (user's call, before the first live
+  day). Set in `spy-0dte.yml`'s `SPY_STRIKE_OFFSET`, which is what Actions
+  actually uses; `.env` and main.ts's default match it.
