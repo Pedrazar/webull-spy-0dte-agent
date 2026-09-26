@@ -1,0 +1,59 @@
+name: SPY 0DTE agent
+
+# One long-running job per trading day: waits for the 10:30am ET entry,
+# buys, watches the stop, and closes at 3:45pm ET, then commits the log.
+#
+# Triggered ONLY by workflow_dispatch from an external cron-job.org job at
+# 7:20am America/Los_Angeles, Mon-Fri (= 10:20am ET year-round, since ET is
+# always PT+3). GitHub's own `schedule:` trigger is deliberately absent —
+# both sibling projects measured it firing hours late, and a late start
+# here would miss the entry. Do NOT dispatch earlier than ~10:10am ET:
+# 10:20 -> ~15:50 ET is ~330 min, and the hosted-runner hard cap is 360;
+# main.ts refuses to start before 10:10 ET on Actions for that reason.
+on:
+  workflow_dispatch: {}
+
+concurrency:
+  group: spy-0dte
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  session:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - run: npm ci
+
+      - name: Run trading session
+        env:
+          WEBULL_APP_KEY: ${{ secrets.WEBULL_APP_KEY }}
+          WEBULL_APP_SECRET: ${{ secrets.WEBULL_APP_SECRET }}
+          WEBULL_BASE_URL: ${{ secrets.WEBULL_BASE_URL }}
+          WEBULL_SANDBOX_ACCOUNT_ID: ${{ secrets.WEBULL_SANDBOX_ACCOUNT_ID }}
+          SPY_CONTRACTS: "1"
+          SPY_STRIKE_OFFSET: "2"
+          SPY_STOP_LOSS_PCT: "0.50"
+        run: npx tsx main.ts
+
+      - name: Commit state + trade log
+        if: always()
+        run: |
+          git config user.name "webull-spy-0dte-agent"
+          git config user.email "actions@users.noreply.github.com"
+          git add -f spy-state.json spy-trades.jsonl 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "nothing to commit"
+          else
+            git commit -m "spy 0dte session $(date -u +%Y-%m-%d)"
+            git pull --rebase origin main
+            git push origin HEAD:main
+          fi

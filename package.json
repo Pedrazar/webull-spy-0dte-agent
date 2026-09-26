@@ -1,0 +1,20 @@
+{
+  "name": "webull-spy-0dte-agent",
+  "version": "1.0.0",
+  "description": "SPY 0DTE call-buying agent against the Webull OpenAPI sandbox (paper trading).",
+  "main": "main.ts",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "dotenv": "^17.4.2",
+    "ts-node": "^10.9.2",
+    "tsx": "^4.23.12",
+    "typescript": "^7.0.2"
+  }
+}

@@ -1,0 +1,13 @@
+# secrets
+.env
+
+# logs
+*.log
+
+# deps / build
+node_modules/
+dist/
+
+# spy-state.json and spy-trades.jsonl are INTENTIONALLY tracked: they're
+# committed back by the workflow after each session, the only persistence
+# across ephemeral Actions runners.
