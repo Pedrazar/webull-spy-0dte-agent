@@ -156,8 +156,28 @@ interface Settled {
   filledPrice: number | null;
 }
 
+/** CONFIRMED LIVE 2026-09-28: a transient API error here (that day, a 429
+ * rate-limit from settleOrder()'s poll loop calling this repeatedly during
+ * exitPosition()'s stop-loss retries) used to throw uncaught all the way
+ * through exitPosition() and main(), killing the whole process mid-retry.
+ * The position was left open with no further attempt to close it for the
+ * rest of the trading day — exitPosition()'s own giveUpAtMin deadline and
+ * "still holding -> log exit_failed with an auto-exercise warning" fallback
+ * never got a chance to run, because the crash happened first. Caught
+ * fortunate that day (the position was gone by end of day with no
+ * unusual balance change, so it evidently expired rather than being
+ * exercised — but that was luck, not this code working as designed).
+ * Treating a transient fetch error the same as "no order data yet" lets
+ * every caller's existing retry/timeout logic keep working instead of the
+ * whole process dying. */
 async function orderStatus(client: WebullClient, accountId: string, clientOrderId: string) {
-  const o = (await getOrderDetail(client, accountId, clientOrderId)).orders?.[0];
+  let o;
+  try {
+    o = (await getOrderDetail(client, accountId, clientOrderId)).orders?.[0];
+  } catch (err) {
+    console.warn(`[order] status check for ${clientOrderId} failed transiently, treating as unknown:`, err);
+    o = undefined;
+  }
   return {
     status: o?.status ?? "UNKNOWN",
     filledQuantity: parseFloat(o?.filled_quantity ?? "0"),
@@ -291,33 +311,51 @@ async function exitPosition(
   let proceeds = 0;
   let sold = 0;
   for (let attempt = 1; nyMinutesOf(new Date()) < giveUpAtMin; attempt++) {
-    const current = await findHeldCall(client, accountId);
-    if (!current) break;
-    const q = await quote(client, current.optionSymbol);
-    if (!q) {
-      console.warn(`[exit] no quote for ${current.optionSymbol}, retrying`);
+    // CONFIRMED LIVE 2026-09-28: an uncaught transient error anywhere in
+    // this loop body (that day: a 429 from settleOrder's poll) used to kill
+    // the whole process mid-retry, skipping past giveUpAtMin entirely and
+    // leaving the position open with zero further attempts to close it —
+    // the exit_failed/auto-exercise-warning fallback below never got a
+    // chance to run. Wrapping the whole body means any transient error just
+    // costs one retry (bounded by the loop's own giveUpAtMin deadline
+    // either way), never gets misread as "no position, done" (that
+    // conclusion only ever comes from a successful findHeldCall call
+    // actually returning null, never from a failure), and — if genuinely
+    // still unable to close by the deadline — always reaches the graceful
+    // "still holding, log exit_failed, warn about exercise risk" path
+    // below instead of crashing past it.
+    try {
+      const current = await findHeldCall(client, accountId);
+      if (!current) break;
+      const q = await quote(client, current.optionSymbol);
+      if (!q) {
+        console.warn(`[exit] no quote for ${current.optionSymbol}, retrying`);
+        await sleep(5000);
+        continue;
+      }
+      const limit = Math.max(0.01, round2(q.bid - 0.05 * (attempt - 1)));
+      const res = await placeOptionOrder(client, accountId, {
+        underlyingSymbol: SYMBOL,
+        optionSymbol: current.optionSymbol,
+        side: "SELL",
+        quantity: current.contracts,
+        optionType: "CALL",
+        strikePrice: current.strike,
+        expirationDate: current.expiration,
+        limitPrice: limit,
+        positionIntent: "SELL_TO_CLOSE",
+      });
+      const s = await settleOrder(client, accountId, (res.client_order_id as string) ?? "");
+      console.log(`[exit] SELL_TO_CLOSE attempt ${attempt} @ ${limit} (${reason}): ${s.status}, filled ${s.filledQuantity}`);
+      if (s.filledQuantity > 0) {
+        proceeds += (s.filledPrice ?? limit) * s.filledQuantity;
+        sold += s.filledQuantity;
+      }
+      if (s.status === "UNKNOWN") await sleep(10_000); // let it settle before re-checking positions
+    } catch (err) {
+      console.warn(`[exit] attempt ${attempt} hit a transient error, will retry:`, err);
       await sleep(5000);
-      continue;
     }
-    const limit = Math.max(0.01, round2(q.bid - 0.05 * (attempt - 1)));
-    const res = await placeOptionOrder(client, accountId, {
-      underlyingSymbol: SYMBOL,
-      optionSymbol: current.optionSymbol,
-      side: "SELL",
-      quantity: current.contracts,
-      optionType: "CALL",
-      strikePrice: current.strike,
-      expirationDate: current.expiration,
-      limitPrice: limit,
-      positionIntent: "SELL_TO_CLOSE",
-    });
-    const s = await settleOrder(client, accountId, (res.client_order_id as string) ?? "");
-    console.log(`[exit] SELL_TO_CLOSE attempt ${attempt} @ ${limit} (${reason}): ${s.status}, filled ${s.filledQuantity}`);
-    if (s.filledQuantity > 0) {
-      proceeds += (s.filledPrice ?? limit) * s.filledQuantity;
-      sold += s.filledQuantity;
-    }
-    if (s.status === "UNKNOWN") await sleep(10_000); // let it settle before re-checking positions
   }
 
   if (await findHeldCall(client, accountId)) {
