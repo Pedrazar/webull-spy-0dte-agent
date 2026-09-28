@@ -86,8 +86,46 @@ accepted), SELL_TO_CLOSE, the positions shape for a long call (the wheel only
 confirmed a short put), and the full Actions run. The first trading day is
 the test, so watch that run.
 
+## Status as of 2026-09-28 (first real trading day — a real incident)
+
+cron-job.org fired correctly at 7:20am PT. Entry worked: bought 1
+`SPY260928C00766000` (strike $766, ~$1.45 ITM) at $1.96 = $196, logged
+correctly with `underlyingPrice`/`targetStrike`. The stop-loss correctly
+triggered at 10:59am ET (mid fell to $0.98, exactly 50% of entry) and
+`exitPosition()` began retrying SELL_TO_CLOSE, stepping the limit down
+$0.05 each attempt — 4 attempts, all cancelled unfilled (0 filled). Then a
+429 from an **unguarded API call crashed the entire process** at 11:00am
+ET, 5 hours before the close, with the position still open and zero
+further attempts to close it for the rest of the day — see the git log for
+the full fix (`orderStatus()` now treats a transient fetch error as
+"unknown" instead of throwing; more importantly, `exitPosition()`'s whole
+retry-loop body is now wrapped in try/catch so ANY transient error just
+costs one retry, bounded by the loop's own `giveUpAtMin` deadline, and can
+never be misread as "no position, done").
+
+**Verified after the fact** (checked live positions/orders/balance
+directly, not just the log): no SPY position, no open orders, cash healthy
+(~$1,001,033 vs. the $1,000,000 start), no unusual large debit — so the
+call evidently expired rather than being exercised into 100 shares. Bounded
+loss, roughly the $196 premium. **This was a fortunate outcome, not this
+code working as designed** — nothing closed the position on purpose; nobody
+was watching a live crash for 5 hours, and the auto-exercise warning this
+project's own `exit_failed` event exists specifically to surface never got
+logged, because the crash happened before reaching that fallback path.
+
+**Residual gap, not yet addressed**: "Startup resumes any open 0DTE call
+first" (see Design notes) only helps if something actually triggers a
+fresh run after a crash — this project's `workflow_dispatch` fires exactly
+once per day via cron-job.org, with no automatic retry-on-failure. A
+*different* future crash (not this exact bug, now fixed) would still strand
+a position with nothing to pick it up except a manual re-run. Worth
+deciding later whether that's an acceptable risk for a paper account or
+needs a second cron-job.org safety-net trigger later in the afternoon.
+
 ## Change log
 
+- **2026-09-28: fixed a process crash mid-exit-retry** — see the status
+  update above and the git log (`main.ts`'s `orderStatus()`/`exitPosition()`).
 - **2026-09-26: strike offset $2 -> $1** (user's call, before the first live
   day). Set in `spy-0dte.yml`'s `SPY_STRIKE_OFFSET`, which is what Actions
   actually uses; `.env` and main.ts's default match it.
