@@ -92,13 +92,31 @@ export function pickStrikeNearest(contracts: OptionContract[], target: number): 
   })[0];
 }
 
-async function quote(client: WebullClient, optionSymbol: string): Promise<{ bid: number; ask: number; mid: number } | null> {
+interface Quote {
+  bid: number;
+  ask: number;
+  mid: number;
+  /** Last-trade price and the snapshot's own reported staleness, per
+   * CLAUDE.md's "quotes are 15 minutes delayed in the sandbox" note —
+   * logged at every order decision (2026-09-30 diagnostic) so a fill
+   * failure can be checked against how stale the quote actually was. */
+  lastPrice: number | null;
+  delayMinutes: number | null;
+}
+
+async function quote(client: WebullClient, optionSymbol: string): Promise<Quote | null> {
   try {
     const snap = (await getOptionSnapshot(client, [optionSymbol]))[0];
     const bid = parseFloat(snap?.bid ?? "");
     const ask = parseFloat(snap?.ask ?? "");
     if (!(bid > 0) || !(ask > 0)) return null;
-    return { bid, ask, mid: round2((bid + ask) / 2) };
+    return {
+      bid,
+      ask,
+      mid: round2((bid + ask) / 2),
+      lastPrice: snap?.price ? parseFloat(snap.price) : null,
+      delayMinutes: (snap as { delay_minutes?: number })?.delay_minutes ?? null,
+    };
   } catch (err) {
     console.warn(`[quote] snapshot for ${optionSymbol} failed:`, err);
     return null;
@@ -188,17 +206,34 @@ async function orderStatus(client: WebullClient, accountId: string, clientOrderI
 /** Waits up to waitMs for the order to reach a terminal state; if it
  * hasn't, cancels it and waits for the cancel to be CONFIRMED before
  * returning. Callers never place a replacement order until this returns,
- * so two working orders can't exist for the same contract. */
-async function settleOrder(client: WebullClient, accountId: string, clientOrderId: string, waitMs = 10_000): Promise<Settled> {
-  const deadline = Date.now() + waitMs;
+ * so two working orders can't exist for the same contract.
+ *
+ * DIAGNOSTIC MODE (added 2026-09-30, after two straight days of orders
+ * placed right at the live bid/ask going unfilled — a BUY_TO_OPEN on
+ * 2026-09-29, a SELL_TO_CLOSE sequence on 2026-09-28): the old 10s window
+ * gave up long before we could tell whether the sandbox ever actually
+ * matches these orders. This version (a) waits much longer by default —
+ * still well inside the entry deadline / EOD budget, see callers — (b)
+ * logs every single poll with elapsed time so the run log itself becomes
+ * the trace, and (c) keeps watching for a while after the cancel too, in
+ * case a fill and a cancel are racing rather than the order simply never
+ * matching. Poll cadence is slower (2.5s) than the old 1.5s specifically
+ * to avoid retriggering the 429 that crashed 2026-09-28's run (fixed
+ * separately in orderStatus() below, but no reason to lean on that fix
+ * more than necessary). */
+async function settleOrder(client: WebullClient, accountId: string, clientOrderId: string, waitMs = 30_000): Promise<Settled> {
+  const start = Date.now();
+  const deadline = start + waitMs;
   let s = await orderStatus(client, accountId, clientOrderId);
+  console.log(`[order] ${clientOrderId} poll @0.0s: ${s.status}`);
   while (!TERMINAL.has(s.status) && Date.now() < deadline) {
-    await sleep(1500);
+    await sleep(2500);
     s = await orderStatus(client, accountId, clientOrderId);
+    console.log(`[order] ${clientOrderId} poll @${((Date.now() - start) / 1000).toFixed(1)}s: ${s.status}`);
   }
   if (TERMINAL.has(s.status)) return s;
 
-  console.log(`[order] ${clientOrderId} still ${s.status} after ${waitMs / 1000}s — cancelling`);
+  console.log(`[order] ${clientOrderId} still ${s.status} after ${(waitMs / 1000).toFixed(0)}s — cancelling`);
   try {
     await cancelOptionOrder(client, accountId, clientOrderId);
   } catch (err) {
@@ -206,9 +241,10 @@ async function settleOrder(client: WebullClient, accountId: string, clientOrderI
     // the status re-check below is what decides.
     console.warn(`[order] cancel ${clientOrderId} failed:`, err);
   }
-  for (let i = 0; i < 10; i++) {
-    await sleep(1500);
+  for (let i = 0; i < 8; i++) {
+    await sleep(2500);
     s = await orderStatus(client, accountId, clientOrderId);
+    console.log(`[order] ${clientOrderId} post-cancel poll @${((Date.now() - start) / 1000).toFixed(1)}s: ${s.status}`);
     if (TERMINAL.has(s.status)) return s;
   }
   return { ...s, status: "UNKNOWN" };
@@ -247,12 +283,21 @@ async function enter(client: WebullClient, accountId: string): Promise<HeldCall 
 
   // Buy at the ask for a likely fill; one retry at a fresh ask if the first
   // attempt doesn't fill within the settle window.
+  //
+  // DIAGNOSTIC (2026-09-30): each attempt gets a full 60s to fill (instead
+  // of the old 10s) before falling back to cancel — there's ~30 minutes of
+  // budget before ENTRY_DEADLINE_MIN, so two 60s+20s attempts cost nothing
+  // we need elsewhere. The quote logged here (bid/ask/last/delayMinutes)
+  // lets a later look compare what we traded against to what SPY actually
+  // did in that window, to test whether the 15-min-delayed sandbox quote
+  // is why the limit order isn't marketable.
   for (let attempt = 1; attempt <= 2; attempt++) {
     const q = await quote(client, contract.symbol);
     if (!q) {
       logEvent({ event: "skipped", reason: "no_quote", detail: `no usable bid/ask for ${contract.symbol}` });
       return null;
     }
+    console.log(`[quote] ${contract.symbol} bid ${q.bid} ask ${q.ask} last ${q.lastPrice} delay_minutes ${q.delayMinutes}`);
     const res = await placeOptionOrder(client, accountId, {
       underlyingSymbol: SYMBOL,
       optionSymbol: contract.symbol,
@@ -265,8 +310,10 @@ async function enter(client: WebullClient, accountId: string): Promise<HeldCall 
       positionIntent: "BUY_TO_OPEN",
     });
     const clientOrderId = (res.client_order_id as string) ?? "";
-    const s = await settleOrder(client, accountId, clientOrderId);
+    const s = await settleOrder(client, accountId, clientOrderId, 60_000);
     console.log(`[order] BUY_TO_OPEN attempt ${attempt} @ ${q.ask}: ${s.status}, filled ${s.filledQuantity}`);
+    const qAfter = await quote(client, contract.symbol);
+    if (qAfter) console.log(`[quote] ${contract.symbol} AFTER settle: bid ${qAfter.bid} ask ${qAfter.ask} last ${qAfter.lastPrice} (was ask ${q.ask} at order time)`);
 
     // Broker positions decide what we actually hold (partial fills, or an
     // UNKNOWN settle, both land here correctly).
@@ -334,6 +381,7 @@ async function exitPosition(
         continue;
       }
       const limit = Math.max(0.01, round2(q.bid - 0.05 * (attempt - 1)));
+      console.log(`[quote] ${current.optionSymbol} bid ${q.bid} ask ${q.ask} last ${q.lastPrice} delay_minutes ${q.delayMinutes}`);
       const res = await placeOptionOrder(client, accountId, {
         underlyingSymbol: SYMBOL,
         optionSymbol: current.optionSymbol,
@@ -345,8 +393,15 @@ async function exitPosition(
         limitPrice: limit,
         positionIntent: "SELL_TO_CLOSE",
       });
+      // DIAGNOSTIC (2026-09-30): default settleOrder wait is now 30s (was
+      // 10s) — see settleOrder's own comment. Not raised further here the
+      // way entry's is to 60s: this loop's own giveUpAtMin is the real
+      // budget guard for the EOD case (as little as 14 minutes), and it
+      // already retries as many times as that budget allows.
       const s = await settleOrder(client, accountId, (res.client_order_id as string) ?? "");
       console.log(`[exit] SELL_TO_CLOSE attempt ${attempt} @ ${limit} (${reason}): ${s.status}, filled ${s.filledQuantity}`);
+      const qAfter = await quote(client, current.optionSymbol);
+      if (qAfter) console.log(`[quote] ${current.optionSymbol} AFTER settle: bid ${qAfter.bid} ask ${qAfter.ask} last ${qAfter.lastPrice} (was bid ${q.bid} at order time)`);
       if (s.filledQuantity > 0) {
         proceeds += (s.filledPrice ?? limit) * s.filledQuantity;
         sold += s.filledQuantity;

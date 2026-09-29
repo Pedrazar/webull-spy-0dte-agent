@@ -122,8 +122,49 @@ a position with nothing to pick it up except a manual re-run. Worth
 deciding later whether that's an acceptable risk for a paper account or
 needs a second cron-job.org safety-net trigger later in the afternoon.
 
+## Status update — 2026-09-29: entry never filled, a second straight day of the same pattern
+
+10:30am ET entry tried twice (SPY 765.31 -> target 764.31 -> the 764 call),
+first at ask $2.10, then a fresh ask $1.97 after the first attempt's 10s
+window expired — **both orders sat SUBMITTED for the full window and were
+cancelled unfilled**, never a FILLED or even a partial fill. No crash this
+time (the 2026-09-28 fix held), and the code did exactly what it should
+when a fill never comes: gave up cleanly, logged `skipped(order_not_filled)`,
+no position, no open orders. **Net for the day: $0, but also zero trading**
+— confirmed live via positions/open-orders, nothing to close.
+
+This is the same shape as 2026-09-28's exit failure (4 SELL_TO_CLOSE
+attempts, all cancelled unfilled) but on the entry/BUY side instead — two
+different days, two different sides of the trade, same symptom: an order
+placed right at the live quoted bid/ask doesn't get matched by the sandbox
+within the old 10s window. Leading hypothesis, from this project's own
+"quotes are 15 minutes delayed in the sandbox" note (see Design notes): the
+snapshot's bid/ask may be stale relative to whatever price the sandbox's
+matching engine actually requires to consider an order marketable, so a
+limit order built from that snapshot may not really be at the true
+current price.
+
+**Diagnostic changes made 2026-09-30, not yet exercised live**:
+`settleOrder()`'s wait is now 30s by default (was 10s) with every poll
+logged (`[order] <id> poll @Xs: STATUS`), not just the final outcome, and
+entry specifically gets a full 60s per attempt (there's ~30 min of budget
+before `ENTRY_DEADLINE_MIN`, so this costs nothing). Both `enter()` and the
+exit loop now log the full snapshot (`bid`/`ask`/`last`/`delay_minutes`) at
+order time and again right after the order settles, so a real run's log can
+show directly whether the quote moved between those two points (supporting
+the staleness hypothesis) or stayed put while never filling (pointing at
+something else — a sandbox matching quirk unrelated to quote staleness).
+**Next trading day's run is the test** — read its full log for the
+`[quote]`/`[order] ... poll` lines, not just the summary lines, to answer
+this.
+
 ## Change log
 
+- **2026-09-30: diagnostic instrumentation for the fill-failure pattern**
+  — longer settle windows (60s entry / 30s default, up from 10s) with
+  full poll-by-poll and before/after-quote logging. See the status update
+  above. Not a behavior fix yet — the goal is to see what's actually
+  happening before changing the retry/pricing logic.
 - **2026-09-28: fixed a process crash mid-exit-retry** — see the status
   update above and the git log (`main.ts`'s `orderStatus()`/`exitPosition()`).
 - **2026-09-26: strike offset $2 -> $1** (user's call, before the first live
