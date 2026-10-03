@@ -158,6 +158,37 @@ something else — a sandbox matching quirk unrelated to quote staleness).
 `[quote]`/`[order] ... poll` lines, not just the summary lines, to answer
 this.
 
+## Status update — 2026-10-02: the fill-failure pattern, finally caught in full detail, and it's expensive
+
+Stop triggered at 15:18:49 ET (mid $0.87, threshold $0.90). What followed
+is the clearest trace yet of the pattern first seen on 2026-09-28 (exit)
+and 2026-09-29 (entry): **6 straight SELL_TO_CLOSE attempts, each priced at
+that moment's live bid minus a growing nickel (attempt N: bid - 0.05*(N-1)),
+each left sitting SUBMITTED for the full 30s diagnostic window, then
+cancelled unfilled** — including attempts priced AT OR BELOW a bid the
+market had already moved to (e.g. attempt 1 at $0.86 while the very next
+quote read showed the bid had risen to $0.88 — a sell below the live bid
+should be trivially marketable, and still didn't fill). Only attempt 7,
+priced $0.42 — **30 cents, ~42%, below that moment's $0.72 bid** — finally
+filled (at $0.45, broker-confirmed).
+
+**This rules out "just wait longer" as the fix.** 2026-09-30's diagnostic
+change (10s -> 30s/60s windows) didn't help here: the problem isn't time,
+it's price — nothing filled until the limit was repriced far more
+aggressively than a nickel at a time. **Cost of not knowing this sooner**:
+the stop triggered at $0.87 (would have been a ~51% loss, right at target)
+but didn't actually fill until $0.45 three and a half minutes later (a 75%
+loss) — ~$42 worse than it should have been, almost entirely attributable
+to chasing a falling price with too-small, too-slow repricing steps while
+real theta/price decay kept eating the option's value underneath the retry
+loop.
+
+**Not yet fixed** — this needs an actual strategy change (much more
+aggressive repricing, e.g. percentage-of-price steps instead of a flat
+$0.05, and/or a far more aggressive starting discount given this is a stop
+whose whole point is urgency over price), not just more logging. Flagged to
+the user 2026-10-02; implementation pending their go-ahead.
+
 ## Change log
 
 - **2026-09-30: diagnostic instrumentation for the fill-failure pattern**
