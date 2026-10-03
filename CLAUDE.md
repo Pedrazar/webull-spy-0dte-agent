@@ -86,6 +86,24 @@ accepted), SELL_TO_CLOSE, the positions shape for a long call (the wheel only
 confirmed a short put), and the full Actions run. The first trading day is
 the test, so watch that run.
 
+## Status as of 2026-10-02 (expected behavior, but a real slippage observation)
+
+Today's stop-loss triggered cleanly (no crash, no unfilled-forever order —
+both earlier fixes holding), but illustrates a real characteristic of the
+retry-chasing exit design worth knowing about: SPY fell fast (option mid
+$0.98 -> $0.42 in ~4 minutes), the stop fired at mid $0.87 (vs. the $0.90
+threshold), and then **6 of 7** SELL_TO_CLOSE attempts were cancelled
+unfilled while chasing the falling bid down before attempt 7 finally filled
+— at $0.42, well below the ~$0.90 the stop was meant to cut losses at.
+Realized: -$134 (-74.9%), notably worse than the intended ~50%. Each retry
+reads a *fresh* current bid (not the previous attempt's price minus $0.05),
+so in a fast decline the steps between attempts can be much larger than
+$0.05 and the whole sequence can meaningfully lag a crashing market. Not a
+bug — this is the documented trade-off of a client-side stop with
+limit-order retries (see Design notes) rather than a resting broker stop
+order — but a real cost worth the user knowing about if this pattern
+recurs often. No code change made for this; flagging for awareness only.
+
 ## Status as of 2026-09-28 (first real trading day — a real incident)
 
 cron-job.org fired correctly at 7:20am PT. Entry worked: bought 1
