@@ -60,6 +60,25 @@ function hhmm(min: number): string {
   return `${Math.floor(min / 60)}:${String(min % 60).padStart(2, "0")}`;
 }
 
+/** Escalating repricing aggressiveness for an unfilled order: starts close
+ * to the live quote and roughly doubles each attempt, capped at 50%.
+ *
+ * FIX for the 2026-10-02 incident: the old scheme stepped by a flat $0.05
+ * per attempt (and waited 30s between attempts) — on that day the real
+ * fillable price turned out to be ~42% below the live bid, so it took 7
+ * attempts and 3.5 minutes to cross it, during which the option kept
+ * losing value anyway: the stop triggered at a 51%-loss price but didn't
+ * actually fill until a 75%-loss price, ~$42 worse than it should have
+ * been. A flat-cents step doesn't scale with the option's price either
+ * (nickel steps mean something very different on a $0.40 option than a
+ * $4 one). Percentage-based and exponential instead: aggressive enough to
+ * likely cross whatever the real matching price is within 3-4 attempts,
+ * without jumping straight to a throwaway price on the very first try in
+ * case (as on most other days) the live quote was actually fillable as-is. */
+function escalatingDiscount(attempt: number): number {
+  return Math.min(0.5, 0.03 * 2 ** (attempt - 1));
+}
+
 // ---------------------------------------------------------------------------
 // Market data
 // ---------------------------------------------------------------------------
@@ -208,20 +227,25 @@ async function orderStatus(client: WebullClient, accountId: string, clientOrderI
  * returning. Callers never place a replacement order until this returns,
  * so two working orders can't exist for the same contract.
  *
- * DIAGNOSTIC MODE (added 2026-09-30, after two straight days of orders
- * placed right at the live bid/ask going unfilled — a BUY_TO_OPEN on
- * 2026-09-29, a SELL_TO_CLOSE sequence on 2026-09-28): the old 10s window
- * gave up long before we could tell whether the sandbox ever actually
- * matches these orders. This version (a) waits much longer by default —
- * still well inside the entry deadline / EOD budget, see callers — (b)
- * logs every single poll with elapsed time so the run log itself becomes
- * the trace, and (c) keeps watching for a while after the cancel too, in
- * case a fill and a cancel are racing rather than the order simply never
- * matching. Poll cadence is slower (2.5s) than the old 1.5s specifically
- * to avoid retriggering the 429 that crashed 2026-09-28's run (fixed
- * separately in orderStatus() below, but no reason to lean on that fix
- * more than necessary). */
-async function settleOrder(client: WebullClient, accountId: string, clientOrderId: string, waitMs = 30_000): Promise<Settled> {
+ * Every poll is logged with elapsed time (added 2026-09-30 as a
+ * diagnostic, kept permanently — cheap and it's what caught the
+ * 2026-10-02 pattern below) and it keeps watching for a while after a
+ * cancel too, in case a fill and a cancel are racing rather than the
+ * order simply never matching. Poll cadence is 2.5s (slower than the
+ * original 1.5s) specifically to avoid retriggering the 429 that crashed
+ * 2026-09-28's run (fixed separately in orderStatus() below, but no
+ * reason to lean on that fix more than necessary).
+ *
+ * waitMs default: 2026-09-30 raised this to 30s to test whether orders
+ * placed at the live quote simply needed more time. 2026-10-02 settled
+ * that question — they don't: every confirmed fill across 5 live trading
+ * days settled in under 3 seconds, and the one multi-attempt chase that
+ * day showed repricing (escalatingDiscount(), used by both callers) is
+ * what actually gets an order filled, not waiting longer at the same
+ * price. Callers now pass an explicit short wait (10s) and lean on more,
+ * more-aggressively-priced attempts instead; this default only matters
+ * for a future caller that forgets to pass one. */
+async function settleOrder(client: WebullClient, accountId: string, clientOrderId: string, waitMs = 10_000): Promise<Settled> {
   const start = Date.now();
   const deadline = start + waitMs;
   let s = await orderStatus(client, accountId, clientOrderId);
@@ -281,22 +305,21 @@ async function enter(client: WebullClient, accountId: string): Promise<HeldCall 
   const strike = parseFloat(contract.strike_price);
   console.log(`[decision] SPY ${price} - ${STRIKE_OFFSET} = target ${target} -> ${contract.symbol} (strike ${strike})`);
 
-  // Buy at the ask for a likely fill; one retry at a fresh ask if the first
-  // attempt doesn't fill within the settle window.
-  //
-  // DIAGNOSTIC (2026-09-30): each attempt gets a full 60s to fill (instead
-  // of the old 10s) before falling back to cancel — there's ~30 minutes of
-  // budget before ENTRY_DEADLINE_MIN, so two 60s+20s attempts cost nothing
-  // we need elsewhere. The quote logged here (bid/ask/last/delayMinutes)
-  // lets a later look compare what we traded against to what SPY actually
-  // did in that window, to test whether the 15-min-delayed sandbox quote
-  // is why the limit order isn't marketable.
-  for (let attempt = 1; attempt <= 2; attempt++) {
+  // Buy at an escalating premium over the ask if earlier attempts don't
+  // fill — see escalatingDiscount()'s comment for why (2026-10-02 fix).
+  // Each attempt gets 10s to fill (down from 60s on 2026-09-30: every
+  // confirmed fill across 5 live trading days settled in under 3s, so a
+  // long wait was only ever wasted time, never a real chance at a fill —
+  // the 2026-10-02 incident showed waiting longer doesn't help, repricing
+  // does). 5 attempts x (10s + ~20s cancel-confirm) is ~2.5 minutes
+  // worst case, trivial against the ~30 minute entry budget.
+  for (let attempt = 1; attempt <= 5; attempt++) {
     const q = await quote(client, contract.symbol);
     if (!q) {
       logEvent({ event: "skipped", reason: "no_quote", detail: `no usable bid/ask for ${contract.symbol}` });
       return null;
     }
+    const limitPrice = round2(q.ask * (1 + escalatingDiscount(attempt)));
     console.log(`[quote] ${contract.symbol} bid ${q.bid} ask ${q.ask} last ${q.lastPrice} delay_minutes ${q.delayMinutes}`);
     const res = await placeOptionOrder(client, accountId, {
       underlyingSymbol: SYMBOL,
@@ -306,12 +329,12 @@ async function enter(client: WebullClient, accountId: string): Promise<HeldCall 
       optionType: "CALL",
       strikePrice: strike,
       expirationDate: today,
-      limitPrice: q.ask,
+      limitPrice,
       positionIntent: "BUY_TO_OPEN",
     });
     const clientOrderId = (res.client_order_id as string) ?? "";
-    const s = await settleOrder(client, accountId, clientOrderId, 60_000);
-    console.log(`[order] BUY_TO_OPEN attempt ${attempt} @ ${q.ask}: ${s.status}, filled ${s.filledQuantity}`);
+    const s = await settleOrder(client, accountId, clientOrderId, 10_000);
+    console.log(`[order] BUY_TO_OPEN attempt ${attempt} @ ${limitPrice} (ask ${q.ask} +${(escalatingDiscount(attempt) * 100).toFixed(0)}%): ${s.status}, filled ${s.filledQuantity}`);
     const qAfter = await quote(client, contract.symbol);
     if (qAfter) console.log(`[quote] ${contract.symbol} AFTER settle: bid ${qAfter.bid} ask ${qAfter.ask} last ${qAfter.lastPrice} (was ask ${q.ask} at order time)`);
 
@@ -345,9 +368,9 @@ async function enter(client: WebullClient, accountId: string): Promise<HeldCall 
 // Exit
 // ---------------------------------------------------------------------------
 
-/** Sells the held call with LIMIT orders at the bid, stepping the price
- * down $0.05 per unfilled attempt, until flat or `giveUpAtMin` (NY
- * minutes). Returns true once the broker shows no position. */
+/** Sells the held call with LIMIT orders, repricing down from the bid by
+ * escalatingDiscount() each unfilled attempt, until flat or `giveUpAtMin`
+ * (NY minutes). Returns true once the broker shows no position. */
 async function exitPosition(
   client: WebullClient,
   accountId: string,
@@ -380,7 +403,17 @@ async function exitPosition(
         await sleep(5000);
         continue;
       }
-      const limit = Math.max(0.01, round2(q.bid - 0.05 * (attempt - 1)));
+      // FIX for the 2026-10-02 incident: a flat $0.05 step with a 30s wait
+      // took 7 attempts / 3.5 minutes to cross the real fillable price,
+      // which was ~42% below the live bid — the option lost most of its
+      // remaining value during that chase, turning an on-target ~51%-loss
+      // stop into an actual 75%-loss exit. Percentage-based escalation
+      // (see escalatingDiscount()) plus a short 10s settle wait (down from
+      // 30s — every confirmed fill across 5 trading days settled in under
+      // 3s, so the extra wait was never buying a real chance at a fill)
+      // means far more attempts fit in the same giveUpAtMin budget, each
+      // one meaningfully more aggressive than the last.
+      const limit = Math.max(0.01, round2(q.bid * (1 - escalatingDiscount(attempt))));
       console.log(`[quote] ${current.optionSymbol} bid ${q.bid} ask ${q.ask} last ${q.lastPrice} delay_minutes ${q.delayMinutes}`);
       const res = await placeOptionOrder(client, accountId, {
         underlyingSymbol: SYMBOL,
@@ -393,13 +426,8 @@ async function exitPosition(
         limitPrice: limit,
         positionIntent: "SELL_TO_CLOSE",
       });
-      // DIAGNOSTIC (2026-09-30): default settleOrder wait is now 30s (was
-      // 10s) — see settleOrder's own comment. Not raised further here the
-      // way entry's is to 60s: this loop's own giveUpAtMin is the real
-      // budget guard for the EOD case (as little as 14 minutes), and it
-      // already retries as many times as that budget allows.
-      const s = await settleOrder(client, accountId, (res.client_order_id as string) ?? "");
-      console.log(`[exit] SELL_TO_CLOSE attempt ${attempt} @ ${limit} (${reason}): ${s.status}, filled ${s.filledQuantity}`);
+      const s = await settleOrder(client, accountId, (res.client_order_id as string) ?? "", 10_000);
+      console.log(`[exit] SELL_TO_CLOSE attempt ${attempt} @ ${limit} (bid ${q.bid} -${(escalatingDiscount(attempt) * 100).toFixed(0)}%) (${reason}): ${s.status}, filled ${s.filledQuantity}`);
       const qAfter = await quote(client, current.optionSymbol);
       if (qAfter) console.log(`[quote] ${current.optionSymbol} AFTER settle: bid ${qAfter.bid} ask ${qAfter.ask} last ${qAfter.lastPrice} (was bid ${q.bid} at order time)`);
       if (s.filledQuantity > 0) {

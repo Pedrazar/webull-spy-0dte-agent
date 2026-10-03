@@ -16,13 +16,14 @@ Every trading day, one entry, one exit:
 - **10:30am ET** (one hour after the open): read SPY's last 1-min bar close,
   buy `SPY_CONTRACTS` (1) of the **CALL expiring today** whose strike is
   nearest to `price - SPY_STRIKE_OFFSET` ($1), i.e. ~$1 in the money. The
-  order is a LIMIT at the ask, with one retry at a fresh ask.
+  order is a LIMIT, repriced upward from the ask across up to 5 attempts
+  via `escalatingDiscount()` if it doesn't fill (see Design notes).
 - **Stop**: close if the option's mid falls to `(1 - SPY_STOP_LOSS_PCT)` x
   entry (50% loss), checked every `SPY_POLL_MS` (15s).
 - **EOD**: close at 15 minutes before the close, 3:45pm ET (12:45pm on the
   `NYSE_EARLY_CLOSES` half-days in `marketHours.ts`).
-- Exits are LIMIT sells at the bid, stepping down $0.05 per unfilled attempt,
-  retried until 1 minute before the close. If still holding, the agent logs
+- Exits are LIMIT sells, repriced down from the bid the same way, retried
+  until 1 minute before the close. If still holding, the agent logs
   `exit_failed` and exits non-zero (red Actions run). **An ITM 0DTE call left
   at expiry is auto-exercised into 100 SPY shares per contract (~$77k), so
   close it by hand.**
@@ -208,6 +209,18 @@ whose whole point is urgency over price), not just more logging. Flagged to
 the user 2026-10-02; implementation pending their go-ahead.
 
 ## Change log
+
+- **2026-10-02: fixed the repricing scheme** (the actual fix for the
+  pattern documented in the status update above). `escalatingDiscount()`
+  replaces the old flat-$0.05-per-attempt step with a percentage-based
+  exponential one (3%, 6%, 12%, 24%, 48%, capped 50%), used by both
+  `enter()` (escalating up from the ask, 5 attempts) and `exitPosition()`
+  (escalating down from the bid, retried until `giveUpAtMin`).
+  `settleOrder()`'s per-attempt wait dropped back to 10s (from the
+  2026-09-30 diagnostic's 30s/60s) — confirmed unnecessary: every fill
+  across 5 trading days settled in under 3 seconds, so the long wait only
+  ever cost time without buying a real chance at a fill. Not yet
+  exercised live.
 
 - **2026-09-30: diagnostic instrumentation for the fill-failure pattern**
   — longer settle windows (60s entry / 30s default, up from 10s) with
