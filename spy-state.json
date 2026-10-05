@@ -1,11 +1,11 @@
 {
-  "date": "2026-10-02",
+  "date": "2026-10-05",
   "entered": true,
-  "optionSymbol": "SPY261002C00771000",
-  "strike": 771,
+  "optionSymbol": "SPY261005C00772000",
+  "strike": 772,
   "contracts": 1,
-  "entryPrice": 1.79,
-  "exitPrice": 0.45,
-  "exitReason": "stop_loss",
-  "realizedPnl": -134
+  "entryPrice": 1.24,
+  "exitPrice": 3.33,
+  "exitReason": "eod",
+  "realizedPnl": 209
 }
