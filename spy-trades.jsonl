@@ -13,3 +13,5 @@
 {"ts":"2026-10-06T19:45:43.351Z","event":"exit_filled","optionSymbol":"SPY261006C00778000","reason":"eod","contracts":1,"entryPrice":1.51,"exitPrice":1.57,"realizedPnl":6,"pctReturn":3.97}
 {"ts":"2026-10-07T14:30:28.361Z","event":"entry_filled","optionSymbol":"SPY261007C00773000","strike":773,"expiration":"2026-10-07","contracts":1,"entryPrice":2.08,"totalCost":208,"underlyingPrice":774.4401,"targetStrike":773.44,"clientOrderId":"7f51ee0e4db142e3a3b596bf9c7f8daf"}
 {"ts":"2026-10-07T19:45:10.252Z","event":"exit_filled","optionSymbol":"SPY261007C00773000","reason":"eod","contracts":1,"entryPrice":2.08,"exitPrice":4.25,"realizedPnl":217,"pctReturn":104.33}
+{"ts":"2026-10-08T14:31:00.961Z","event":"entry_filled","optionSymbol":"SPY261008C00775000","strike":775,"expiration":"2026-10-08","contracts":1,"entryPrice":1.88,"totalCost":188,"underlyingPrice":776.44,"targetStrike":775.44,"clientOrderId":"9e80dc0c8d42449a806a4f3732be3b77"}
+{"ts":"2026-10-08T15:26:37.137Z","event":"exit_filled","optionSymbol":"SPY261008C00775000","reason":"stop_loss","contracts":1,"entryPrice":1.88,"exitPrice":0.72,"realizedPnl":-116,"pctReturn":-61.7}
