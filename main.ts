@@ -26,6 +26,8 @@ import {
   getOptionChain,
   getOptionSnapshot,
   getPositions,
+  getAccountBalance,
+  extractOptionBuyingPower,
   placeOptionOrder,
   cancelOptionOrder,
   getOrderDetail,
@@ -304,6 +306,32 @@ async function enter(client: WebullClient, accountId: string): Promise<HeldCall 
   }
   const strike = parseFloat(contract.strike_price);
   console.log(`[decision] SPY ${price} - ${STRIKE_OFFSET} = target ${target} -> ${contract.symbol} (strike ${strike})`);
+
+  // Buying-power guard — added 2026-10-16 for live trading. Sandbox's
+  // ~$1M paper buying power never made this a real constraint, but a real
+  // account's buying power is finite, and this one (Individual Margin) has
+  // other activity sharing it (see CLAUDE.md's live-account notes). Checks
+  // against the worst case the escalating-discount retry could pay (up to
+  // 50% over the current ask), not just today's starting ask, so this
+  // can't pass the check and then still fail to afford its own retries.
+  const precheckQuote = await quote(client, contract.symbol);
+  if (precheckQuote) {
+    const worstCaseCost = round2(precheckQuote.ask * 1.5 * CONTRACTS * 100);
+    const balance = await getAccountBalance(client, accountId).catch((err) => {
+      console.warn("[guard] balance lookup failed, cannot verify buying power:", err);
+      return null;
+    });
+    const buyingPower = balance ? extractOptionBuyingPower(balance) : null;
+    if (buyingPower !== null && buyingPower < worstCaseCost) {
+      logEvent({
+        event: "skipped",
+        reason: "insufficient_buying_power",
+        detail: `need up to $${worstCaseCost} (${CONTRACTS}x ${contract.symbol}, worst case 50% over ask $${precheckQuote.ask}), have $${buyingPower} option buying power`,
+      });
+      return null;
+    }
+    console.log(`[guard] buying power ${buyingPower ?? "unknown"} >= worst-case cost ${worstCaseCost}, proceeding`);
+  }
 
   // Buy at an escalating premium over the ask if earlier attempts don't
   // fill — see escalatingDiscount()'s comment for why (2026-10-02 fix).

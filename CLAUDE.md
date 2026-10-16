@@ -310,3 +310,70 @@ order rejection.
 activity (-$310 unrealized P&L, -$1085 day P&L at the time of this check)
 — it is not a dedicated/empty account, confirmed per the 2026-10-16
 account-selection finding above.
+
+## Status update — 2026-10-16 (continued further): live workflow built, NOT yet dispatched
+
+Built on top of the two cleared blockers above:
+
+- **`prodTokenManager.ts`**: storage is now pluggable (`TokenStore`
+  interface). `fileTokenStore` (unchanged behavior, `prod-token.json`) for
+  local dev; `envTokenStore()` (new) reads the cached token from
+  `WEBULL_PROD_TOKEN`/`WEBULL_PROD_TOKEN_EXPIRES` env vars and, on a
+  refresh, writes the new value to a local gitignored file
+  (`prod-token-refreshed.json`) instead of anywhere git-tracked.
+- **`liveMain.ts`** (new): the live entry point. Reuses `main.ts`'s
+  `runSession()` completely unchanged — same entry/stop/EOD/
+  escalating-repricing logic that's been proven over 13 paper trading
+  days — only the client/credentials/account differ. Hard-refuses to run
+  unless `SPY_LOG_PREFIX=live` is already set in the process environment
+  *before* the process starts: confirmed live that setting it as a plain
+  statement inside the file does NOT work (TypeScript's CommonJS output
+  hoists `import`s above other top-level code, so `tradeLogger.ts`'s
+  prefix would already have been read and defaulted to "spy" by the time
+  that statement ran) — without this guard, real trades would have
+  silently been appended to the paper log files.
+- **`tradeLogger.ts`**: file paths now take a `SPY_LOG_PREFIX` prefix
+  (defaults to `spy`, unchanged for paper). Live writes to
+  `live-state.json`/`live-trades.jsonl` instead — real and paper records
+  never share a file, even though both live in this same public repo.
+- **`main.ts`**: added a buying-power guard to `enter()` — checks the
+  account's `option_buying_power` against the worst case the
+  escalating-discount retry could pay (up to 50% over the current ask)
+  before placing the first order, logging `skipped(insufficient_buying_power)`
+  and refusing to even attempt the buy if it's not covered. Never needed
+  against sandbox's ~$1M paper buying power; the real margin account's
+  $916.31 (as of this check, shared with other activity in that account)
+  is a real constraint.
+- **`.github/workflows/spy-0dte-live.yml`** (new): same shape as the paper
+  workflow, needs its own cron-job.org dispatch entry (not shared with
+  paper's). After the trading step, a new step pushes a refreshed token
+  (if `prod-token-refreshed.json` exists) back to GitHub Secrets via
+  `gh secret set`, using a separate fine-grained PAT
+  (`WEBULL_SECRETS_PAT`, scoped to Secrets: Read and write on this repo
+  only — the default `GITHUB_TOKEN` can never manage repo secrets). The
+  token value is masked from the log (`::add-mask::`) before use.
+- **Repo secrets set 2026-10-16**: `WEBULL_PROD_APP_KEY`/`_APP_SECRET`/
+  `_BASE_URL`/`_ACCOUNT_ID` (Individual Margin,
+  `A5H8R5F7IQGJ69DKPVC4RSNJLA`), and `WEBULL_PROD_TOKEN`/`_TOKEN_EXPIRES`
+  bootstrapped from the locally-approved token (valid until 2026-10-31).
+  **`WEBULL_SECRETS_PAT` is NOT yet set** — needs the user to create a
+  fine-grained PAT (this repo only, Secrets: Read and write) in GitHub
+  settings; not urgent for the first several live days since the
+  bootstrapped token only needs refreshing within 5 days of its Oct 31
+  expiry (`REFRESH_BUFFER_MS`), but every run after that point will fail
+  without it.
+
+**Not yet done, genuinely blocking a fully unattended go-live**:
+1. `liveMain.ts` has never been run end-to-end — `testProdAuth.ts` only
+   exercised the PREVIEW endpoint, never `placeOptionOrder` itself against
+   production. The very first real dispatch is also the first real test of
+   the live PLACE path, with no prior live confirmation the way the
+   sandbox build had (`testOptionOrderPreview.ts` before `main.ts` was
+   trusted there, then a manually-triggered day-1 paper run). Recommend
+   the first live dispatch be done manually by the user, watching, during
+   the entry window — not blind via an unattended cron trigger — treated
+   explicitly as the verification step it actually is.
+2. `WEBULL_SECRETS_PAT` doesn't exist yet (see above).
+3. No cron-job.org dispatch entry exists for `spy-0dte-live.yml` yet —
+   deliberately not set up until after a manually-watched first run is
+   confirmed working.

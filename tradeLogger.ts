@@ -7,13 +7,20 @@
  * today?" — so a same-day re-dispatch of the workflow can't buy a second
  * time after the first position was already stopped out. Whether a
  * position is open right now always comes from the broker, never from here.
+ *
+ * File prefix is configurable (2026-10-16, for live trading): `LOG_PREFIX`
+ * defaults to `spy` (the existing paper files, unchanged), but the live
+ * entrypoint sets `SPY_LOG_PREFIX=live` so real trades write to
+ * `live-trades.jsonl`/`live-state.json` instead — real and paper records
+ * never mix in the same file, even though they live in the same repo.
  */
 
 import fs from "fs";
 import path from "path";
 
-const LOG_PATH = path.join(__dirname, "spy-trades.jsonl");
-const STATE_PATH = path.join(__dirname, "spy-state.json");
+const PREFIX = process.env.SPY_LOG_PREFIX ?? "spy";
+const LOG_PATH = path.join(__dirname, `${PREFIX}-trades.jsonl`);
+const STATE_PATH = path.join(__dirname, `${PREFIX}-state.json`);
 
 export type SpyEvent =
   | {
@@ -54,7 +61,7 @@ export type SpyEvent =
     }
   | {
       event: "skipped";
-      reason: "holiday" | "already_entered_today" | "past_entry_window" | "no_0dte_contract" | "no_quote" | "no_price" | "order_not_filled";
+      reason: "holiday" | "already_entered_today" | "past_entry_window" | "no_0dte_contract" | "no_quote" | "no_price" | "order_not_filled" | "insufficient_buying_power";
       detail: string;
     }
   | {

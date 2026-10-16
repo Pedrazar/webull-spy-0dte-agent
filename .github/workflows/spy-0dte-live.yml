@@ -1,0 +1,95 @@
+name: SPY 0DTE agent (LIVE — real money)
+
+# Same shape as spy-0dte.yml (one long-running job per trading day,
+# workflow_dispatch only, same 10:10 ET earliest-start guard inside
+# liveMain.ts/main.ts) but against the real Individual Margin account.
+# Needs its OWN cron-job.org dispatch entry — intentionally not shared
+# with the paper workflow's, so one can be paused independently of the
+# other. See CLAUDE.md's 2026-10-16 status updates for the full
+# verification history before this was trusted to exist.
+#
+# TOKEN HANDLING — the one real difference from the paper workflow. The
+# production access token is a rotating bearer credential, unlike the
+# paper agent's static sandbox app key/secret. This repo is PUBLIC, so
+# unlike spy-state.json/spy-trades.jsonl (safe to commit — real trade
+# RECORDS being public was an explicit user choice), the token itself must
+# never reach git history, where anyone could read and use it. Instead:
+# WEBULL_PROD_TOKEN/WEBULL_PROD_TOKEN_EXPIRES are read from Secrets at
+# start, and if prodTokenManager.ts refreshes them mid-run, the new values
+# are written to a local gitignored file (prod-token-refreshed.json, never
+# committed) that a later step in THIS SAME job reads and pushes back to
+# Secrets via `gh secret set` — using a separate fine-grained PAT
+# (WEBULL_SECRETS_PAT, scoped to Secrets: Read and write on this repo
+# only) since the default GITHUB_TOKEN can never manage repo secrets. The
+# value is masked from the log before use. In practice this path is rarely
+# exercised: the token is bootstrapped valid through 2026-10-31 and only
+# refreshes within 5 days of expiry (prodTokenManager.ts's
+# REFRESH_BUFFER_MS) — but WEBULL_SECRETS_PAT must exist before THAT
+# happens, or every run past then fails.
+on:
+  workflow_dispatch: {}
+
+concurrency:
+  group: spy-0dte-live
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  session:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - run: npm ci
+
+      - name: Run LIVE trading session
+        env:
+          WEBULL_PROD_APP_KEY: ${{ secrets.WEBULL_PROD_APP_KEY }}
+          WEBULL_PROD_APP_SECRET: ${{ secrets.WEBULL_PROD_APP_SECRET }}
+          WEBULL_PROD_BASE_URL: ${{ secrets.WEBULL_PROD_BASE_URL }}
+          WEBULL_PROD_ACCOUNT_ID: ${{ secrets.WEBULL_PROD_ACCOUNT_ID }}
+          WEBULL_PROD_TOKEN: ${{ secrets.WEBULL_PROD_TOKEN }}
+          WEBULL_PROD_TOKEN_EXPIRES: ${{ secrets.WEBULL_PROD_TOKEN_EXPIRES }}
+          SPY_LOG_PREFIX: "live"
+          SPY_CONTRACTS: "1"
+          SPY_STRIKE_OFFSET: "1"
+          SPY_STOP_LOSS_PCT: "0.50"
+        run: npx tsx liveMain.ts
+
+      - name: Push refreshed prod token back to Secrets (only if it changed)
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.WEBULL_SECRETS_PAT }}
+        run: |
+          if [ -f prod-token-refreshed.json ]; then
+            TOKEN=$(node -e "console.log(require('./prod-token-refreshed.json').token)")
+            EXPIRES=$(node -e "console.log(require('./prod-token-refreshed.json').expiresAt)")
+            echo "::add-mask::$TOKEN"
+            gh secret set WEBULL_PROD_TOKEN --body "$TOKEN" -R "${{ github.repository }}"
+            gh secret set WEBULL_PROD_TOKEN_EXPIRES --body "$EXPIRES" -R "${{ github.repository }}"
+            rm -f prod-token-refreshed.json
+            echo "Refreshed token pushed to Secrets."
+          else
+            echo "No token refresh this run."
+          fi
+
+      - name: Commit state + trade log
+        if: always()
+        run: |
+          git config user.name "webull-spy-0dte-agent-live"
+          git config user.email "actions@users.noreply.github.com"
+          git add -f live-state.json live-trades.jsonl 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "nothing to commit"
+          else
+            git commit -m "LIVE spy 0dte session $(date -u +%Y-%m-%d)"
+            git pull --rebase origin main
+            git push origin HEAD:main
+          fi

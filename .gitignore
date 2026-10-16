@@ -1,6 +1,7 @@
 # secrets
 .env
 prod-token.json
+prod-token-refreshed.json
 
 # logs
 *.log
@@ -9,6 +10,10 @@ prod-token.json
 node_modules/
 dist/
 
-# spy-state.json and spy-trades.jsonl are INTENTIONALLY tracked: they're
-# committed back by the workflow after each session, the only persistence
-# across ephemeral Actions runners.
+# spy-state.json/spy-trades.jsonl (paper) and live-state.json/
+# live-trades.jsonl (real account) are INTENTIONALLY tracked: they're
+# committed back by their respective workflows after each session, the
+# only persistence across ephemeral Actions runners. Real trade records
+# being public was an explicit user choice (2026-10-16) — the credentials
+# that could place new trades are what stay secret (.env, both token
+# files above), not the historical record of what already happened.

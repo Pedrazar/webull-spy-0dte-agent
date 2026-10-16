@@ -22,9 +22,22 @@
  * complete on its own. refresh_token extends an already-NORMAL token
  * without requiring re-approval — also confirmed live.
  *
- * The resulting token is cached in prod-token.json (gitignored — it's a
- * live credential) so a scheduled run doesn't need a human present unless
- * the cached token has actually gone invalid.
+ * STORAGE is pluggable (added 2026-10-16, for this project only — the
+ * sibling `webull-agent` project still always uses the file store, since
+ * its token only feeds a watchlist push, not real orders). Local dev
+ * defaults to `prod-token.json` (gitignored). GitHub Actions uses a
+ * different store instead: this repo is PUBLIC, and unlike the paper
+ * agent's state (safe to git-commit back after each run), a live bearer
+ * token must never land in git history where anyone could read and use
+ * it. The CI store (`envTokenStore()`) reads the cached token from
+ * `WEBULL_PROD_TOKEN`/`WEBULL_PROD_TOKEN_EXPIRES` env vars (populated from
+ * GitHub Secrets) and, when a refresh produces a new token, writes it to a
+ * local gitignored file (`prod-token-refreshed.json`) instead of git — a
+ * workflow step after the trading script runs reads that file and pushes
+ * the new value back to the Secrets via `gh secret set` (see
+ * `.github/workflows/spy-0dte-live.yml`), masking it from the log first.
+ * The token itself never appears in a commit, a log line, or this
+ * process's stdout at any point.
  */
 
 import fs from "fs";
@@ -32,9 +45,10 @@ import path from "path";
 import { WebullClient } from "./webullClient";
 
 const TOKEN_PATH = path.join(__dirname, "prod-token.json");
+const REFRESHED_OUTPUT_PATH = path.join(__dirname, "prod-token-refreshed.json");
 const REFRESH_BUFFER_MS = 5 * 24 * 60 * 60 * 1000; // refresh once <5 days from expiry, so a scheduled run never races expiry mid-flight
 
-interface StoredToken {
+export interface StoredToken {
   token: string;
   expiresAt: number;
 }
@@ -45,16 +59,42 @@ interface TokenResponse {
   status: "PENDING" | "NORMAL" | "INVALID" | "EXPIRED";
 }
 
-function loadStoredToken(): StoredToken | null {
-  try {
-    return JSON.parse(fs.readFileSync(TOKEN_PATH, "utf8"));
-  } catch {
-    return null;
-  }
+/** Where a valid token is read from and a refreshed one is written to. */
+export interface TokenStore {
+  load(): StoredToken | null;
+  save(token: string, expiresAt: number): void;
 }
 
-function saveToken(token: string, expiresAt: number): void {
-  fs.writeFileSync(TOKEN_PATH, JSON.stringify({ token, expiresAt }, null, 2));
+/** Local dev / the sibling project's usage: a gitignored JSON file. */
+export const fileTokenStore: TokenStore = {
+  load(): StoredToken | null {
+    try {
+      return JSON.parse(fs.readFileSync(TOKEN_PATH, "utf8"));
+    } catch {
+      return null;
+    }
+  },
+  save(token: string, expiresAt: number): void {
+    fs.writeFileSync(TOKEN_PATH, JSON.stringify({ token, expiresAt }, null, 2));
+  },
+};
+
+/** CI: reads the cached token from env vars (GitHub Secrets, passed in by
+ * the workflow), and on a refresh writes the new value to a local
+ * gitignored file for a later workflow step to push back to Secrets —
+ * never to git, never logged. */
+export function envTokenStore(): TokenStore {
+  return {
+    load(): StoredToken | null {
+      const token = process.env.WEBULL_PROD_TOKEN;
+      const expiresAt = process.env.WEBULL_PROD_TOKEN_EXPIRES;
+      if (!token || !expiresAt) return null;
+      return { token, expiresAt: parseInt(expiresAt, 10) };
+    },
+    save(token: string, expiresAt: number): void {
+      fs.writeFileSync(REFRESHED_OUTPUT_PATH, JSON.stringify({ token, expiresAt }, null, 2));
+    },
+  };
 }
 
 function sleep(ms: number): Promise<void> {
@@ -64,11 +104,12 @@ function sleep(ms: number): Promise<void> {
 /**
  * Returns a valid access token, refreshing or creating one as needed.
  * Throws with a clear, actionable message if a fresh PENDING request never
- * gets approved within the poll window — callers (stockScreener.ts) should
- * catch this and skip the watchlist push rather than fail the whole run.
+ * gets approved within the poll window — callers (stockScreener.ts, or
+ * this project's live order code) should catch this and refuse to trade
+ * rather than proceed without a confirmed token.
  */
-export async function getValidAccessToken(prodClient: WebullClient): Promise<string> {
-  const stored = loadStoredToken();
+export async function getValidAccessToken(prodClient: WebullClient, store: TokenStore = fileTokenStore): Promise<string> {
+  const stored = store.load();
 
   if (stored && stored.expiresAt - Date.now() > REFRESH_BUFFER_MS) {
     return stored.token; // still comfortably valid, no network call needed
@@ -83,7 +124,7 @@ export async function getValidAccessToken(prodClient: WebullClient): Promise<str
         token: stored.token,
       });
       if (refreshed.status === "NORMAL") {
-        saveToken(refreshed.token, refreshed.expires);
+        store.save(refreshed.token, refreshed.expires);
         console.log(`[prod-token] refreshed, valid until ${new Date(refreshed.expires).toISOString()}`);
         return refreshed.token;
       }
@@ -94,7 +135,7 @@ export async function getValidAccessToken(prodClient: WebullClient): Promise<str
 
   const created = await prodClient.post<TokenResponse>("/openapi/auth/token/create", {});
   if (created.status === "NORMAL") {
-    saveToken(created.token, created.expires);
+    store.save(created.token, created.expires);
     return created.token;
   }
 
@@ -111,7 +152,7 @@ export async function getValidAccessToken(prodClient: WebullClient): Promise<str
       token: created.token,
     });
     if (checked.status === "NORMAL") {
-      saveToken(checked.token, checked.expires);
+      store.save(checked.token, checked.expires);
       console.log(`[prod-token] approved, valid until ${new Date(checked.expires).toISOString()}`);
       return checked.token;
     }
