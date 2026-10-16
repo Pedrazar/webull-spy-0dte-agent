@@ -232,3 +232,44 @@ the user 2026-10-02; implementation pending their go-ahead.
 - **2026-09-26: strike offset $2 -> $1** (user's call, before the first live
   day). Set in `spy-0dte.yml`'s `SPY_STRIKE_OFFSET`, which is what Actions
   actually uses; `.env` and main.ts's default match it.
+
+## Status update — 2026-10-16: live-account verification, two hard blockers found
+
+User asked to go live Monday (2026-10-19). Before writing any live order
+code, ran `testProdAuth.ts` (preview-only, never places an order) against
+the real production API. Findings:
+
+**Token approval: works.** The sibling `webull-agent` project's cached
+prod token had expired 2026-09-03; a fresh `create_token` came back
+PENDING and was approved in-app within the 25-second poll window. Valid
+until 2026-10-31. This project now has its own `prod-token.json` (own
+cache, not shared with the sibling project) and `prodTokenManager.ts`
+(copied verbatim, see its header).
+
+**Blocker 1 — which real account, genuinely unresolved**: four accounts
+exist under this login — Traditional IRA, Individual Margin, Individual
+Cash, Roth IRA. Individual Cash shows **`option_buying_power: $1.00`** —
+effectively unfunded. Individual Margin has real existing activity
+(`total_unrealized_profit_loss: -$360`, `total_day_profit_loss: -$1135.22`
+at the time of this check) — not a dedicated/empty account, so running an
+unattended bot in it means sharing buying power and risk with whatever
+else happens there. IRA accounts have their own options-approval-level and
+day-trading restrictions that haven't been checked. **This is the user's
+decision, not inferable from the API** — flagged, not resolved.
+
+**Blocker 2 — no options market data subscription on the production API
+key**: `getOptionSnapshot()` against production returned
+`403 MARKET_DATA_NOT_SUBSCRIBED: "Insufficient permission, please
+subscribe to US_OPTION."` The chain endpoint worked (237 real 0DTE SPY
+contracts came back), but with no snapshot quotes, nothing downstream can
+work — no entry price, no stop-loss check, no exit price. This needs to be
+resolved on Webull's side (a subscription, likely with its own cost/signup
+flow) — not something fixable in code.
+
+**Also hit `429 TOO_MANY_REQUESTS` looping balance checks across 4
+accounts with no delay** — minor, needs a backoff, but moot until the two
+blockers above are resolved.
+
+**Did not reach**: snapshot-dependent steps, the order preview, or any
+live-agent code changes. Recommended NOT going live Monday until both
+blockers are resolved and the preview step is confirmed.
