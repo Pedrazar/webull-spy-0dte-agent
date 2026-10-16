@@ -273,3 +273,40 @@ blockers above are resolved.
 **Did not reach**: snapshot-dependent steps, the order preview, or any
 live-agent code changes. Recommended NOT going live Monday until both
 blockers are resolved and the preview step is confirmed.
+
+## Status update — 2026-10-16 (continued): both blockers cleared, one new risk identified
+
+User subscribed to OPRA Real-Time Non-display ($4.99/mo) and chose the
+**Individual Margin** account (`account_id A5H8R5F7IQGJ69DKPVC4RSNJLA`,
+now hardcoded as a safety check in `testProdAuth.ts` — the script refuses
+to run if that ID stops resolving to "Individual Margin"). Re-ran
+`testProdAuth.ts`: snapshot now returns real-time data (`delay_minutes:
+0`, vs. sandbox's 15-min delay), balance confirms $916.31 option buying
+power, and the BUY_TO_OPEN preview was accepted by production in the same
+shape as sandbox. `.env` gained `WEBULL_PROD_ACCOUNT_ID`.
+
+**New risk found, not yet resolved**: the production access token
+(`prod-token.json`) is a rotating bearer credential — unlike the paper
+agent's static sandbox app key/secret (safely stored as GitHub encrypted
+secrets, never exposed), this token changes on every refresh and would
+need to persist across GitHub Actions' ephemeral runners somehow. The
+paper agent's existing pattern for that (git-commit the file back after
+each run, see `spy-0dte.yml`) is **not safe to reuse here** — this repo is
+public, so committing a live token means anyone can read it from git
+history and use it to see the real account or place real trades until it
+expires. Options not yet decided: (a) have the workflow rewrite a GitHub
+Secret via a PAT instead of committing a file, (b) run the live agent
+locally instead of on Actions (avoids ever sending the token to GitHub at
+all), or (c) something else. **Blocks writing the live GitHub Actions
+workflow until decided.**
+
+**Also not yet done**: `main.ts`'s entry path has no buying-power check —
+never needed against sandbox's effectively-unlimited paper buying power,
+but the margin account's real $916.31 is a real constraint that should be
+checked and logged before attempting a buy, not just discovered via an
+order rejection.
+
+**Also noted, not a blocker**: the margin account already shows other real
+activity (-$310 unrealized P&L, -$1085 day P&L at the time of this check)
+— it is not a dedicated/empty account, confirmed per the 2026-10-16
+account-selection finding above.

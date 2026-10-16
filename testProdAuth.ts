@@ -36,6 +36,27 @@ async function run() {
   console.log("=== Step 2: real accounts under this login ===");
   const accounts = await getAccountList(prodClient);
   console.log(JSON.stringify(accounts, null, 2));
+
+  // Safety check (2026-10-16 decision: Individual Margin): refuse to
+  // continue if WEBULL_PROD_ACCOUNT_ID doesn't actually resolve to that
+  // account right now — accounts can be renumbered/relabeled, and this
+  // script (and, later, the live agent) should never silently preview or
+  // trade against an account nobody confirmed.
+  const chosenId = process.env.WEBULL_PROD_ACCOUNT_ID;
+  if (chosenId) {
+    const match = (accounts as Array<{ account_id?: string; account_label?: string; account_type?: string }>).find(
+      (a) => a.account_id === chosenId
+    );
+    if (!match) {
+      throw new Error(`WEBULL_PROD_ACCOUNT_ID ${chosenId} was not found in this login's account list — refusing to continue.`);
+    }
+    console.log(`\nConfirmed WEBULL_PROD_ACCOUNT_ID ${chosenId} = "${match.account_label}" (${match.account_type}).`);
+    if (match.account_label !== "Individual Margin") {
+      throw new Error(
+        `WEBULL_PROD_ACCOUNT_ID ${chosenId} resolves to "${match.account_label}", not "Individual Margin" — refusing to continue. Update this check if the intended account genuinely changed.`
+      );
+    }
+  }
   for (const acct of accounts as Array<{ account_id?: string; brokerage_account_id?: string; [k: string]: unknown }>) {
     const id = (acct.account_id ?? acct.brokerage_account_id) as string | undefined;
     if (!id) continue;
@@ -75,10 +96,14 @@ async function run() {
   }
 
   console.log("\n=== Step 5: BUY_TO_OPEN PREVIEW (production) — does NOT place an order ===");
-  const firstAccountId = ((accounts[0] as { account_id?: string; brokerage_account_id?: string })?.account_id ??
-    (accounts[0] as { account_id?: string; brokerage_account_id?: string })?.brokerage_account_id) as string;
-  console.log(`Using account ${firstAccountId} for the preview.`);
-  const preview = await previewOptionOrder(prodClient, firstAccountId, {
+  // 2026-10-16 decision: Individual Margin (account_id A5H8R5F7IQGJ69DKPVC4RSNJLA,
+  // account_number CVV9HSH3) is the account for live trading — NOT accounts[0]
+  // (that's the Traditional IRA). Hardcoded here deliberately so this script
+  // can never silently preview against the wrong account.
+  const liveAccountId = process.env.WEBULL_PROD_ACCOUNT_ID;
+  if (!liveAccountId) throw new Error("WEBULL_PROD_ACCOUNT_ID must be set in .env to run the preview step");
+  console.log(`Using account ${liveAccountId} for the preview.`);
+  const preview = await previewOptionOrder(prodClient, liveAccountId, {
     underlyingSymbol: "SPY",
     optionSymbol: contract.symbol,
     side: "BUY",
