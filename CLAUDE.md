@@ -377,3 +377,60 @@ Built on top of the two cleared blockers above:
 3. No cron-job.org dispatch entry exists for `spy-0dte-live.yml` yet —
    deliberately not set up until after a manually-watched first run is
    confirmed working.
+
+## Status update — 2026-10-19: FIRST LIVE TRADING DAY — real money, real trade, a real crash, position was never actually at risk
+
+User manually triggered `spy-0dte-live.yml` at 10:12am ET, watched it start.
+**Entry: real fill, SPY 767 call @ $2.10** (10:30:54 ET; paper's own
+independent run bought the identical contract that same minute at $2.25 —
+a useful live/paper cross-check, both sides of the system agreeing).
+
+Stop triggered at 1:09:04pm ET (mid hit exactly $1.05, the 50% level) and
+the SELL_TO_CLOSE **filled for real** at **$1.04** — confirmed directly
+against the broker's own order record, not inferred. **Immediately after
+logging that fill, the process crashed** (`429 TOO_MANY_REQUESTS` on
+`/trading/assets/positions/list`) and the Actions run shows red. **The
+position was never actually at risk** — verified live moments after
+discovering the crash: the real account shows no SPY position and no open
+orders, and the crash happened on a redundant post-fill confirmation
+check, not before the real exit. But `exit_filled` was never logged by the
+running process, so this had to be reconstructed by hand from the
+broker's order records during a routine "how did we do" check — not
+caught proactively.
+
+**Real P&L: -$106 (-50.5%), right on the intended 50% stop** — confirmed
+entry $2.10 / exit $1.04. A reconciliation event was appended to
+`live-trades.jsonl` and `live-state.json` was corrected to match (same
+honest-reconciliation convention the paper agent used on 2026-09-28,
+its own first-day incident).
+
+**Root cause, fixed same day**: `exitPosition()`'s final confirmation
+check (`if (await findHeldCall(...))`) sat OUTSIDE the loop's own
+2026-09-28 try/catch fix — a second instance of that exact bug class in a
+different spot. Fixed two ways: (1) that check is now skipped entirely
+when the loop already has a broker-confirmed fill covering the whole
+position (the fill itself already IS the confirmation — a second
+positions/list call right after it was always redundant, which is also
+why it was hitting rate limits); (2) when a check genuinely is still
+needed, a failure now logs an honest `exit_failed(... "could not confirm,
+verify manually" ...)` instead of crashing or silently assuming either
+outcome. **Not yet re-exercised live** — the next real stop-loss or EOD
+exit on the live account is the verification.
+
+**Also newly observed, real but trivial**: live orders carry real
+regulatory/clearing/SEC fees (~$0.11 total across both legs today) that
+sandbox never charged. `realizedPnl` in the trade log does not currently
+subtract these — worth doing if it ever matters at this position size, not
+urgent at ~$0.11/round-trip.
+
+**Paper vs. live comparison, same day, same contract**: paper -$112
+(-49.78%, entry $2.25/exit $1.13), live -$106 (-50.48%, entry $2.10/exit
+$1.04). Directionally and magnitude-wise consistent — reassuring, even
+though the day's actual result was a loss.
+
+**Still not done before this can run fully unattended**: a cron-job.org
+dispatch entry for `spy-0dte-live.yml` was deliberately never set up
+(per the 2026-10-16 plan — first live day was meant to be manual/watched,
+which it was). Given today's crash, recommend at least one more
+watched live day confirming the exitPosition fix holds before setting up
+unattended daily dispatch.

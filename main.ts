@@ -469,14 +469,41 @@ async function exitPosition(
     }
   }
 
-  if (await findHeldCall(client, accountId)) {
-    logEvent({
-      event: "exit_failed",
-      optionSymbol: held.optionSymbol,
-      reason,
-      detail: `still holding after retrying until ${hhmm(giveUpAtMin)} ET — CLOSE MANUALLY; an ITM 0DTE call left at expiry is auto-exercised into 100 SPY shares per contract`,
+  // CONFIRMED LIVE 2026-10-19 (the live account's very first stop-loss):
+  // this final confirmation check used to run unconditionally and
+  // unguarded — right after a real, broker-confirmed FILLED sell, it hit
+  // a 429 and crashed the whole process uncaught (this line was OUTSIDE
+  // the loop's own 2026-09-28 try/catch fix, a second instance of the
+  // same class of bug). The exit itself had genuinely already succeeded
+  // (verified after the fact directly against the broker's order record:
+  // filled_price 1.04, a clean ~50% stop); only the logging/confirmation
+  // step crashed, so no position was ever actually left unprotected — but
+  // nothing in spy-trades.jsonl/live-trades.jsonl recorded that until a
+  // human asked "how did we do" and it was reconstructed by hand. Fixed
+  // two ways: (1) skip this re-check entirely when the loop itself already
+  // got a broker-confirmed fill covering the whole position — that fill
+  // IS the confirmation, a second positions/list call right after it was
+  // always redundant, not just unsafe; (2) when a check is still needed
+  // (the loop never confirmed a fill), it's now wrapped so a transient
+  // failure logs an honest "unknown, verify manually" instead of crashing
+  // or silently assuming either outcome.
+  if (sold < held.contracts) {
+    const stillHeld = await findHeldCall(client, accountId).catch((err) => {
+      console.warn("[exit] final position check failed, state is genuinely unknown:", err);
+      return "unknown" as const;
     });
-    return false;
+    if (stillHeld === "unknown" || stillHeld) {
+      logEvent({
+        event: "exit_failed",
+        optionSymbol: held.optionSymbol,
+        reason,
+        detail:
+          stillHeld === "unknown"
+            ? `could not confirm final position state after retrying until ${hhmm(giveUpAtMin)} ET (the check itself failed) — VERIFY MANUALLY; an ITM 0DTE call left at expiry is auto-exercised into 100 SPY shares per contract`
+            : `still holding after retrying until ${hhmm(giveUpAtMin)} ET — CLOSE MANUALLY; an ITM 0DTE call left at expiry is auto-exercised into 100 SPY shares per contract`,
+      });
+      return false;
+    }
   }
 
   const exitPrice = sold > 0 ? round2(proceeds / sold) : 0;

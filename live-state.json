@@ -4,5 +4,8 @@
   "optionSymbol": "SPY261019C00767000",
   "strike": 767,
   "contracts": 1,
-  "entryPrice": 2.1
+  "entryPrice": 2.1,
+  "exitPrice": 1.04,
+  "exitReason": "stop_loss",
+  "realizedPnl": -106
 }
