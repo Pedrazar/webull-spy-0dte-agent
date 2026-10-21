@@ -434,3 +434,59 @@ dispatch entry for `spy-0dte-live.yml` was deliberately never set up
 which it was). Given today's crash, recommend at least one more
 watched live day confirming the exitPosition fix holds before setting up
 unattended daily dispatch.
+
+## Status update — 2026-10-20: a real bug sold a position this agent never bought
+
+Live's second trading day. User re-ran `spy-0dte-live.yml` (yesterday's run
+had sat failed; re-running restarts the full session fresh, not a resume).
+Entry: real, SPY 771 call @ $1.95. Stop triggered at 15:12 ET.
+
+**The exit retry loop sold TWO different contracts**: the 771 strike this
+agent actually entered (filled $0.84, a real -$111/-56.9% loss — its own
+first attempt at 770 also got a CANCELLED fill along the way, adding to
+the confusion in the run log), AND a completely separate **770-strike
+call the user had bought themselves, manually, in this same shared
+Individual Margin account** — sold for $1.21, confirmed directly against
+the broker. `findHeldCall()` took the first long SPY call expiring today
+it found, with no check that it was this agent's own position; the
+exit loop's `proceeds`/`sold` accounting blended both fills into one
+number (the process's own logged `exitPrice`/`realizedPnl` for this day
+— 1.02 / -93 — were wrong for both positions and must not be trusted).
+**User confirmed they bought the 770 themselves, and — by coincidence,
+given a market move that day — were fine with it having been sold; this
+was luck, not the code working as designed.** True cost basis for the
+user's own 770 purchase wasn't found in `/openapi/trade/order/history`'s
+recent entries, so the actual gain/loss to the user from that sale isn't
+independently confirmed.
+
+**Separately, the job's own commit of all of today's data (entry_filled,
+the blended exit_filled) never reached origin** — `git pull --rebase`
+inside the workflow hit an add/add conflict against an unrelated commit
+pushed from this conversation around the same time, and the push failed
+(exit code 1), silently, with no retry. Both `live-trades.jsonl`'s
+today-dated lines and `live-state.json`'s "2026-10-20" date were
+reconstructed by hand afterward, from the Actions build log plus
+broker-verified order records (`client_order_id`s `6ee8dcc8...`/
+`3585a6a7...` for the agent's own entry/exit, `9b3c29ef...` for the
+770 sale) — NOT from anything the running process itself ever recorded.
+**This commit-conflict failure mode is not yet fixed** — a future
+same-minute collision between a manual commit and a workflow's own commit
+would silently lose that day's data again.
+
+**Root cause fixed same day**: `findHeldCall()` now takes a required
+`expectedStrike` parameter and only ever matches that exact strike — never
+"any SPY call". Every call site updated, including the startup resume
+path in `runSession()`, which now only resumes by checking today's own
+remembered strike from `spy-state.json`/`live-state.json` (never by
+blind-scanning positions) — if that state is missing or stale, resume is
+skipped entirely rather than guessing. This narrows (but doesn't fully
+close) a separate, much smaller timing gap: a crash in the sub-second
+window between a confirmed fill and the state-file write would still miss
+a resume opportunity — accepted tradeoff, far safer than the old
+behavior given this account demonstrably holds other positions.
+**Not yet re-verified live.**
+
+**This account can no longer be treated as a reasonable approximation of
+dedicated** — it already had other activity as of the 2026-10-16
+selection decision, and today proved that activity can directly collide
+with this agent's own operation, not just share buying power with it.

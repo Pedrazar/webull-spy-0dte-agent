@@ -156,17 +156,33 @@ interface HeldCall {
   costPrice: number; // per-contract, per-share premium paid
 }
 
-/** Today's long SPY 0DTE call, if the broker says we hold one. */
-async function findHeldCall(client: WebullClient, accountId: string): Promise<HeldCall | null> {
+/** The specific SPY 0DTE call this session is managing, matched by EXACT
+ * strike — never falls back to "whatever SPY call the account holds".
+ *
+ * CONFIRMED LIVE 2026-10-20, the live account's second trading day: the
+ * old version took the first long SPY call expiring today it found, with
+ * no check that it was actually this agent's own position. The live
+ * Individual Margin account is shared with the user's own manual trading
+ * (known since the 2026-10-16 account-selection decision — this was never
+ * a hidden risk, just not yet proven to matter) — that day the user had
+ * separately bought a 770-strike call, and when the 771-strike call this
+ * agent actually entered hit its stop, the exit retry loop's repeated
+ * findHeldCall() calls found the 770 position first and sold it too,
+ * mixed into the same proceeds/sold accounting as the real exit. A real,
+ * unauthorized sale of a position this code had no business touching, not
+ * just a bookkeeping error. This account can never be assumed dedicated
+ * again, in code or in judgment. */
+async function findHeldCall(client: WebullClient, accountId: string, expectedStrike: number): Promise<HeldCall | null> {
   const today = todayNyDate();
   const positions: Position[] = await getPositions(client, accountId);
   for (const p of positions) {
     const leg = p.legs?.[0];
     if (p.instrument_type !== "OPTION" || p.symbol !== SYMBOL || !leg) continue;
     if (leg.option_type !== "CALL" || leg.option_expire_date !== today) continue;
+    const strike = parseFloat(leg.option_exercise_price ?? "");
+    if (strike !== expectedStrike) continue;
     const qty = parseFloat(p.quantity);
     if (!(qty > 0)) continue;
-    const strike = parseFloat(leg.option_exercise_price ?? "");
     return {
       optionSymbol: occ(today, strike),
       strike,
@@ -368,7 +384,7 @@ async function enter(client: WebullClient, accountId: string): Promise<HeldCall 
 
     // Broker positions decide what we actually hold (partial fills, or an
     // UNKNOWN settle, both land here correctly).
-    const held = await findHeldCall(client, accountId);
+    const held = await findHeldCall(client, accountId, strike);
     if (held) {
       const entryPrice = held.costPrice || s.filledPrice || q.ask;
       held.costPrice = entryPrice;
@@ -423,7 +439,7 @@ async function exitPosition(
     // "still holding, log exit_failed, warn about exercise risk" path
     // below instead of crashing past it.
     try {
-      const current = await findHeldCall(client, accountId);
+      const current = await findHeldCall(client, accountId, held.strike);
       if (!current) break;
       const q = await quote(client, current.optionSymbol);
       if (!q) {
@@ -488,7 +504,7 @@ async function exitPosition(
   // failure logs an honest "unknown, verify manually" instead of crashing
   // or silently assuming either outcome.
   if (sold < held.contracts) {
-    const stillHeld = await findHeldCall(client, accountId).catch((err) => {
+    const stillHeld = await findHeldCall(client, accountId, held.strike).catch((err) => {
       console.warn("[exit] final position check failed, state is genuinely unknown:", err);
       return "unknown" as const;
     });
@@ -553,7 +569,7 @@ async function monitor(client: WebullClient, accountId: string, held: HeldCall):
     // could be closed by hand in the app).
     if (Date.now() - lastReconcile >= 300_000) {
       lastReconcile = Date.now();
-      if (!(await findHeldCall(client, accountId))) {
+      if (!(await findHeldCall(client, accountId, held.strike))) {
         logEvent({ event: "position_gone", optionSymbol: held.optionSymbol, detail: "broker no longer shows the position (closed outside this agent?)" });
         return true;
       }
@@ -576,18 +592,27 @@ export async function runSession(client: WebullClient, accountId: string): Promi
   }
 
   // Resume first: a position we already hold (e.g. after a crashed/re-run
-  // job) is always managed, whatever the clock or state file say.
-  const existing = await findHeldCall(client, accountId);
-  if (existing) {
-    const state = readState();
-    if (state?.date === today && state.entryPrice) existing.costPrice = state.entryPrice;
-    logEvent({ event: "resumed", optionSymbol: existing.optionSymbol, contracts: existing.contracts, entryPrice: existing.costPrice, detail: "found an open 0DTE call at startup" });
-    writeState({ date: today, entered: true, optionSymbol: existing.optionSymbol, strike: existing.strike, contracts: existing.contracts, entryPrice: existing.costPrice });
-    return monitor(client, accountId, existing);
-  }
-
+  // job) is always managed, whatever the clock says. BUT only by checking
+  // today's own remembered strike (from a previous successful entry_filled
+  // write) — never by scanning for "any SPY call", per the 2026-10-20
+  // finding in findHeldCall()'s own comment: this account holds other SPY
+  // positions that are genuinely none of this agent's business. If the
+  // state file itself is missing/stale (e.g. a crash before it could ever
+  // be written), there is nothing safe to resume — proceed to the normal
+  // entry flow instead of guessing at a strike.
   const state = readState();
   if (state?.date === today && state.entered) {
+    if (state.optionSymbol && state.strike !== undefined) {
+      const existing = await findHeldCall(client, accountId, state.strike);
+      if (existing) {
+        if (state.entryPrice) existing.costPrice = state.entryPrice;
+        logEvent({ event: "resumed", optionSymbol: existing.optionSymbol, contracts: existing.contracts, entryPrice: existing.costPrice, detail: "found today's own 0DTE call still open at startup" });
+        return monitor(client, accountId, existing);
+      }
+      // State says we entered but the broker no longer shows that exact
+      // strike — already closed (by this agent earlier, or by hand).
+      // Nothing to resume; fall through to "already_entered_today" below.
+    }
     logEvent({ event: "skipped", reason: "already_entered_today", detail: `already traded ${state.optionSymbol} today` });
     return true;
   }
