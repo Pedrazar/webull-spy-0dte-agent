@@ -81,6 +81,10 @@ jobs:
           fi
 
       - name: Commit state + trade log
+        # 2026-10-21: see the paper workflow's identical comment -- this
+        # race hit THAT workflow that day (this one's push happened to land
+        # first), but both sides of the race need the same retry fix, since
+        # which one wins is pure timing.
         if: always()
         run: |
           git config user.name "webull-spy-0dte-agent-live"
@@ -90,6 +94,18 @@ jobs:
             echo "nothing to commit"
           else
             git commit -m "LIVE spy 0dte session $(date -u +%Y-%m-%d)"
-            git pull --rebase origin main
-            git push origin HEAD:main
+            pushed=false
+            for attempt in 1 2 3 4 5; do
+              if git pull --rebase origin main && git push origin HEAD:main; then
+                pushed=true
+                break
+              fi
+              echo "push attempt $attempt failed (likely a race with the paper workflow's own commit), retrying in $((attempt * 5))s..."
+              git rebase --abort 2>/dev/null || true
+              sleep $((attempt * 5))
+            done
+            if [ "$pushed" != "true" ]; then
+              echo "::error::failed to push live-state.json/live-trades.jsonl after 5 attempts -- today's record may need manual reconciliation from this run's own log"
+              exit 1
+            fi
           fi

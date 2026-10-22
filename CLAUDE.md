@@ -490,3 +490,38 @@ behavior given this account demonstrably holds other positions.
 dedicated** — it already had other activity as of the 2026-10-16
 selection decision, and today proved that activity can directly collide
 with this agent's own operation, not just share buying power with it.
+
+## Status update — 2026-10-21: the recurring commit-race, now fixed properly
+
+Both agents traded cleanly today — no logic bugs, no crashes. Live: entry
+$2.37, EOD exit $5.06, **+$269 (+113.5%)**, broker-verified. Paper: entry
+$2.30, EOD exit $5.05, **+$275 (+119.6%)**.
+
+**But paper's own commit got rejected** — the exact failure mode flagged
+as "not yet fixed" in the 2026-10-20 status update, now confirmed hitting
+BOTH workflows (that day it was live's commit that got lost to a race
+with a manual push; today it was paper's commit losing a race to live's
+own commit, both finishing near EOD around the same time). The rejection
+is a ref-update race (`cannot lock ref ... is at X but expected Y`), not
+a real content conflict — paper and live touch entirely disjoint files
+(`spy-*.json{,l}` vs `live-*.json{,l}`), so there was nothing to actually
+merge, just a stale local ref at push time. The single pull-rebase-push
+attempt in both workflows had no retry, so it failed outright and the
+step reported red — even though the trading session itself had already
+logged a completely correct `exit_filled`.
+
+**Fixed in both `spy-0dte.yml` and `spy-0dte-live.yml`**: the commit step
+now retries the pull-rebase-push sequence up to 5 times with increasing
+backoff (5s/10s/15s/20s/25s), aborting any stuck rebase between attempts.
+Since the two workflows never touch the same files, a retry has nothing
+real to conflict with — it should resolve cleanly every time. If all 5
+attempts still fail, the step now explicitly fails loudly (`exit 1`)
+rather than silently swallowing it, so a red run always means "go check
+the log," never "something was silently lost with no signal at all."
+
+**Today's actual data, reconstructed by hand one more time** (same
+approach as 2026-10-19/2026-10-20 — pulled directly from the Actions run's
+own log, which had logged everything correctly before the push failed):
+`spy-trades.jsonl`/`spy-state.json` now correctly show today's paper
+result. **Not yet re-verified live** — tomorrow, if both workflows finish
+close together again, is the test.

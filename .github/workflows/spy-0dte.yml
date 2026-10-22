@@ -45,6 +45,17 @@ jobs:
         run: npx tsx main.ts
 
       - name: Commit state + trade log
+        # 2026-10-21: a single pull-rebase-push attempt isn't enough -- this
+        # workflow and spy-0dte-live.yml both finish near EOD and can race
+        # each other's push, even though they touch disjoint files
+        # (spy-*.json{,l} vs live-*.json{,l}; the failure is a ref-update
+        # race, "cannot lock ref ... is at X but expected Y", not a content
+        # conflict). CONFIRMED LIVE that day: the run's own trade data
+        # (a real, correct exit_filled) was silently lost -- the step
+        # failed with no retry, and had to be reconstructed by hand from
+        # the Actions log afterward. Retrying is enough to fix it, since a
+        # fresh rebase against disjoint files has nothing to actually
+        # conflict on.
         if: always()
         run: |
           git config user.name "webull-spy-0dte-agent"
@@ -54,6 +65,18 @@ jobs:
             echo "nothing to commit"
           else
             git commit -m "spy 0dte session $(date -u +%Y-%m-%d)"
-            git pull --rebase origin main
-            git push origin HEAD:main
+            pushed=false
+            for attempt in 1 2 3 4 5; do
+              if git pull --rebase origin main && git push origin HEAD:main; then
+                pushed=true
+                break
+              fi
+              echo "push attempt $attempt failed (likely a race with the live workflow's own commit), retrying in $((attempt * 5))s..."
+              git rebase --abort 2>/dev/null || true
+              sleep $((attempt * 5))
+            done
+            if [ "$pushed" != "true" ]; then
+              echo "::error::failed to push spy-state.json/spy-trades.jsonl after 5 attempts -- today's record may need manual reconciliation from this run's own log"
+              exit 1
+            fi
           fi
