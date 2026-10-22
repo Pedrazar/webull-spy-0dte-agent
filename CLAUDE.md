@@ -20,6 +20,11 @@ Every trading day, one entry, one exit:
   via `escalatingDiscount()` if it doesn't fill (see Design notes).
 - **Stop**: close if the option's mid falls to `(1 - SPY_STOP_LOSS_PCT)` x
   entry (50% loss), checked every `SPY_POLL_MS` (15s).
+- **Profit-lock trailing stop** (added 2026-10-21): once the mid's peak
+  since entry reaches `SPY_PROFIT_LOCK_ARM_PCT` above entry (default 50%),
+  it's armed; from then on, a pullback of `SPY_PROFIT_LOCK_TRAIL_PCT` off
+  the peak (default 15%, not off entry) closes immediately. Before arming,
+  behaves exactly as before (just the stop + EOD).
 - **EOD**: close at 15 minutes before the close, 3:45pm ET (12:45pm on the
   `NYSE_EARLY_CLOSES` half-days in `marketHours.ts`).
 - Exits are LIMIT sells, repriced down from the bid the same way, retried
@@ -525,3 +530,24 @@ own log, which had logged everything correctly before the push failed):
 `spy-trades.jsonl`/`spy-state.json` now correctly show today's paper
 result. **Not yet re-verified live** — tomorrow, if both workflows finish
 close together again, is the test.
+
+## Status update — 2026-10-21 (continued): profit-lock trailing stop added
+
+User observed live's own trade that day peak at +$402 unrealized (mid
+$6.39, 2:16pm ET) then give back to +$269 by the fixed 3:45pm EOD exit —
+nothing existed to protect a big intraday gain, just the loss-stop and
+EOD. Added a profit-lock trailing stop: arms once the peak mid since entry
+reaches `SPY_PROFIT_LOCK_ARM_PCT` (default 50%) above entry, then exits on
+a `SPY_PROFIT_LOCK_TRAIL_PCT` (default 15%) pullback off the peak (not off
+entry). New `exit_filled`/`exit_failed` reason value `"profit_lock"`
+alongside the existing `"stop_loss"`/`"eod"`.
+
+**Validated against that exact day's real price sequence** (311 real mid
+quotes pulled from the Actions run log) before trusting the parameters:
+would have armed early (peak crossed $3.56 well before the real $6.39
+peak) and exited at $5.43 when the sharp drop hit — **$306 realized
+instead of the actual $269**, a genuine improvement on a real trade, not
+just a plausible-sounding idea. **Not yet exercised live** — tomorrow is
+the first real test of this path actually triggering (or correctly NOT
+triggering on a day that never arms, which should look identical to
+before).

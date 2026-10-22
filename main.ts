@@ -42,6 +42,16 @@ const CONTRACTS = parseInt(process.env.SPY_CONTRACTS ?? "1", 10);
 const STRIKE_OFFSET = parseFloat(process.env.SPY_STRIKE_OFFSET ?? "1");
 const STOP_LOSS_PCT = parseFloat(process.env.SPY_STOP_LOSS_PCT ?? "0.50");
 const POLL_MS = parseInt(process.env.SPY_POLL_MS ?? "15000", 10);
+// Profit-lock trailing stop — added 2026-10-21, after a real live trade
+// peaked at +$402 unrealized (mid $6.39) then gave back to +$269 by the
+// fixed 3:45pm EOD exit, a ~33% giveback with nothing in between to catch
+// it. Once the position's peak mid since entry reaches
+// SPY_PROFIT_LOCK_ARM_PCT above entry, it's "armed"; from then on, a pull
+// back of SPY_PROFIT_LOCK_TRAIL_PCT off the peak (not off entry) exits
+// immediately, same escalating-discount sell as the stop-loss. Before
+// arming, behavior is unchanged (just the 50% stop + EOD).
+const PROFIT_LOCK_ARM_PCT = parseFloat(process.env.SPY_PROFIT_LOCK_ARM_PCT ?? "0.50");
+const PROFIT_LOCK_TRAIL_PCT = parseFloat(process.env.SPY_PROFIT_LOCK_TRAIL_PCT ?? "0.15");
 
 const ENTRY_MIN = 10 * 60 + 30; // 10:30am ET
 const ENTRY_DEADLINE_MIN = 11 * 60; // don't enter late if the session started late
@@ -419,7 +429,7 @@ async function exitPosition(
   client: WebullClient,
   accountId: string,
   held: HeldCall,
-  reason: "stop_loss" | "eod",
+  reason: "stop_loss" | "profit_lock" | "eod",
   giveUpAtMin: number
 ): Promise<boolean> {
   let proceeds = 0;
@@ -547,10 +557,15 @@ async function monitor(client: WebullClient, accountId: string, held: HeldCall):
   const closeMin = marketCloseMinutes();
   const exitMin = closeMin - EXIT_BEFORE_CLOSE_MIN;
   const stopPrice = round2(held.costPrice * (1 - STOP_LOSS_PCT));
-  console.log(`[monitor] ${held.optionSymbol} x${held.contracts} entry ${held.costPrice}, stop at mid <= ${stopPrice}, EOD exit ${hhmm(exitMin)} ET`);
+  const armPrice = round2(held.costPrice * (1 + PROFIT_LOCK_ARM_PCT));
+  console.log(
+    `[monitor] ${held.optionSymbol} x${held.contracts} entry ${held.costPrice}, stop at mid <= ${stopPrice}, EOD exit ${hhmm(exitMin)} ET, profit-lock arms at mid >= ${armPrice} (${(PROFIT_LOCK_TRAIL_PCT * 100).toFixed(0)}% trail off peak once armed)`
+  );
 
   let lastLog = 0;
   let lastReconcile = Date.now();
+  let peakMid = held.costPrice; // highest mid seen since entry; only ever rises
+  let armed = false;
   for (;;) {
     if (nyMinutesOf(new Date()) >= exitMin) {
       return exitPosition(client, accountId, held, "eod", closeMin - 1);
@@ -560,9 +575,23 @@ async function monitor(client: WebullClient, accountId: string, held: HeldCall):
       console.log(`[monitor] STOP: mid ${q.mid} <= ${stopPrice}`);
       return exitPosition(client, accountId, held, "stop_loss", closeMin - 1);
     }
+    if (q) {
+      if (q.mid > peakMid) peakMid = q.mid;
+      if (!armed && peakMid >= armPrice) {
+        armed = true;
+        console.log(`[monitor] profit-lock ARMED: peak ${peakMid} >= ${armPrice}`);
+      }
+      if (armed) {
+        const trailStop = round2(peakMid * (1 - PROFIT_LOCK_TRAIL_PCT));
+        if (q.mid <= trailStop) {
+          console.log(`[monitor] PROFIT-LOCK: mid ${q.mid} <= ${trailStop} (${(PROFIT_LOCK_TRAIL_PCT * 100).toFixed(0)}% off peak ${peakMid})`);
+          return exitPosition(client, accountId, held, "profit_lock", closeMin - 1);
+        }
+      }
+    }
     if (Date.now() - lastLog >= 60_000) {
       const pnl = q ? round2((q.mid - held.costPrice) * held.contracts * 100) : null;
-      console.log(`[monitor] bid ${q?.bid ?? "-"} ask ${q?.ask ?? "-"} mid ${q?.mid ?? "-"} | unrealized ${pnl ?? "?"}`);
+      console.log(`[monitor] bid ${q?.bid ?? "-"} ask ${q?.ask ?? "-"} mid ${q?.mid ?? "-"} | unrealized ${pnl ?? "?"} | peak ${peakMid}${armed ? " (armed)" : ""}`);
       lastLog = Date.now();
     }
     // Every 5 minutes, confirm with the broker that we still hold it (it
