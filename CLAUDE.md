@@ -25,7 +25,7 @@ Every trading day, one entry, one exit:
   it's armed; from then on, a pullback of `SPY_PROFIT_LOCK_TRAIL_PCT` off
   the peak (default 15%, not off entry) closes immediately. Before arming,
   behaves exactly as before (just the stop + EOD).
-- **EOD**: close at 15 minutes before the close, 3:45pm ET (12:45pm on the
+- **EOD**: close at 30 minutes before the close, 3:30pm ET (12:30pm on the
   `NYSE_EARLY_CLOSES` half-days in `marketHours.ts`).
 - Exits are LIMIT sells, repriced down from the bid the same way, retried
   until 1 minute before the close. If still holding, the agent logs
@@ -551,3 +551,18 @@ just a plausible-sounding idea. **Not yet exercised live** — tomorrow is
 the first real test of this path actually triggering (or correctly NOT
 triggering on a day that never arms, which should look identical to
 before).
+
+## Status update — 2026-10-21 (continued further): EOD exit moved earlier, 3:45 -> 3:30 ET
+
+User found Webull force-liquidates the live account at 3:45pm ET for
+insufficient funds — a real brokerage-level risk control on the live
+Individual Margin account (shared with other activity, per the 2026-10-16/
+2026-10-20 notes), not something this code controls or gets any warning
+of. Moved `EXIT_BEFORE_CLOSE_MIN` from 15 to 30 (`SPY_EXIT_BEFORE_CLOSE_MIN`
+env var, default 30) so the agent's own EOD exit now fires at 3:30pm ET
+(12:30pm on half-days) — a full 15-minute buffer before 3:45, instead of
+potentially still being mid-retry when Webull's forced sell hits.
+Strictly safer on both fronts: more buffer before the forced sell, AND a
+wider exit-retry budget (`giveUpAtMin` is unchanged at `closeMin - 1`).
+Applies to both paper and live (shared `main.ts`). **Not yet exercised
+live.**

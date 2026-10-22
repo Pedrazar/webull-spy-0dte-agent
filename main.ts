@@ -55,9 +55,19 @@ const PROFIT_LOCK_TRAIL_PCT = parseFloat(process.env.SPY_PROFIT_LOCK_TRAIL_PCT ?
 
 const ENTRY_MIN = 10 * 60 + 30; // 10:30am ET
 const ENTRY_DEADLINE_MIN = 11 * 60; // don't enter late if the session started late
-const EXIT_BEFORE_CLOSE_MIN = 15; // 3:45pm ET on a normal day
+// 2026-10-21: moved from 15 to 30 minutes before close (3:45pm -> 3:30pm
+// ET) — the user found Webull force-liquidates the live account at 3:45pm
+// ET for insufficient funds (a real brokerage-level risk control on the
+// live Individual Margin account, not something this code controls or can
+// see coming). 30 min gives a full 15-minute buffer before that forced
+// sell, instead of the 15-min exit window potentially colliding with it
+// mid-retry. Also widens exitPosition()'s own retry budget (giveUpAtMin
+// stays closeMin-1), so this is strictly safer on both counts, not a
+// trade-off.
+const EXIT_BEFORE_CLOSE_MIN = parseInt(process.env.SPY_EXIT_BEFORE_CLOSE_MIN ?? "30", 10); // 3:30pm ET on a normal day
 /** On Actions, a session started before this can't reach the EOD exit
- * inside the 6-hour runner cap (10:10 -> 15:50 is 340 min + setup). */
+ * inside the 6-hour runner cap (10:10 -> 15:30 is 320 min + setup — even
+ * more margin now that EOD moved from 3:45 to 3:30). */
 const EARLIEST_ACTIONS_START_MIN = 10 * 60 + 10;
 
 function sleep(ms: number): Promise<void> {
