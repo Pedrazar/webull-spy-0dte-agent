@@ -56,14 +56,18 @@ const PROFIT_LOCK_TRAIL_PCT = parseFloat(process.env.SPY_PROFIT_LOCK_TRAIL_PCT ?
 const ENTRY_MIN = 10 * 60 + 30; // 10:30am ET
 const ENTRY_DEADLINE_MIN = 11 * 60; // don't enter late if the session started late
 // 2026-10-21: moved from 15 to 30 minutes before close (3:45pm -> 3:30pm
-// ET) — the user found Webull force-liquidates the live account at 3:45pm
-// ET for insufficient funds (a real brokerage-level risk control on the
-// live Individual Margin account, not something this code controls or can
-// see coming). 30 min gives a full 15-minute buffer before that forced
-// sell, instead of the 15-min exit window potentially colliding with it
-// mid-retry. Also widens exitPosition()'s own retry budget (giveUpAtMin
-// stays closeMin-1), so this is strictly safer on both counts, not a
-// trade-off.
+// ET). CONFIRMED via a real Webull "Forced Liquidation Warning" that day,
+// triggered by the live account's own open position: Webull liquidates an
+// account that lacks the equity to cover exercise/assignment of an ITM
+// 0DTE option — for a SINGLE-leg position (all this strategy ever places),
+// that liquidation window begins at 3:48pm ET (a MULTI-leg position's
+// starts earlier, 3:28pm ET, not relevant here). The live Individual
+// Margin account is nowhere near the ~$76,800/contract equity exercise
+// would need, so this applies every single day a position is still open
+// into the afternoon, not as an occasional edge case. 30 min (exit at
+// 3:30pm) gives an 18-minute buffer before Webull's real 3:48pm deadline —
+// also widens exitPosition()'s own retry budget (giveUpAtMin stays
+// closeMin-1), so this is strictly safer on both counts, not a trade-off.
 const EXIT_BEFORE_CLOSE_MIN = parseInt(process.env.SPY_EXIT_BEFORE_CLOSE_MIN ?? "30", 10); // 3:30pm ET on a normal day
 /** On Actions, a session started before this can't reach the EOD exit
  * inside the 6-hour runner cap (10:10 -> 15:30 is 320 min + setup — even

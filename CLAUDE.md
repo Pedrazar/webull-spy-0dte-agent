@@ -554,15 +554,21 @@ before).
 
 ## Status update — 2026-10-21 (continued further): EOD exit moved earlier, 3:45 -> 3:30 ET
 
-User found Webull force-liquidates the live account at 3:45pm ET for
-insufficient funds — a real brokerage-level risk control on the live
-Individual Margin account (shared with other activity, per the 2026-10-16/
-2026-10-20 notes), not something this code controls or gets any warning
-of. Moved `EXIT_BEFORE_CLOSE_MIN` from 15 to 30 (`SPY_EXIT_BEFORE_CLOSE_MIN`
-env var, default 30) so the agent's own EOD exit now fires at 3:30pm ET
-(12:30pm on half-days) — a full 15-minute buffer before 3:45, instead of
-potentially still being mid-retry when Webull's forced sell hits.
-Strictly safer on both fronts: more buffer before the forced sell, AND a
-wider exit-retry budget (`giveUpAtMin` is unchanged at `closeMin - 1`).
-Applies to both paper and live (shared `main.ts`). **Not yet exercised
-live.**
+User found Webull force-liquidates the live account for insufficient
+equity to cover exercise/assignment of an open ITM 0DTE option — a real
+brokerage-level risk control on the live Individual Margin account
+(shared with other activity, per the 2026-10-16/2026-10-20 notes), not
+something this code controls or gets any warning of. **Confirmed via a
+real Webull "Forced Liquidation Warning" the same day**, triggered by
+that day's own live position: the actual deadline for a SINGLE-leg
+position (all this strategy ever places) is **3:48pm ET** (a MULTI-leg
+position's is earlier, 3:28pm ET — not relevant here). Moved
+`EXIT_BEFORE_CLOSE_MIN` from 15 to 30 (`SPY_EXIT_BEFORE_CLOSE_MIN` env
+var, default 30) so the agent's own EOD exit now fires at 3:30pm ET
+(12:30pm on half-days) — an 18-minute buffer before Webull's real 3:48pm
+deadline. This applies every single day a position survives into the
+afternoon, not as an occasional edge case — the account is nowhere near
+the ~$76,800/contract equity actual exercise would require. Strictly
+safer on both fronts: more buffer before the forced sell, AND a wider
+exit-retry budget (`giveUpAtMin` is unchanged at `closeMin - 1`). Applies
+to both paper and live (shared `main.ts`). **Not yet exercised live.**
