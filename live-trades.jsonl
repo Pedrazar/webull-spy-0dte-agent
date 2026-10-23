@@ -7,3 +7,4 @@
 {"ts":"2026-10-21T19:45:04.543Z","event":"exit_filled","optionSymbol":"SPY261021C00768000","reason":"eod","contracts":1,"entryPrice":2.37,"exitPrice":5.06,"realizedPnl":269,"pctReturn":113.5}
 {"ts":"2026-10-22T14:30:17.637Z","event":"entry_filled","optionSymbol":"SPY261022C00762000","strike":762,"expiration":"2026-10-22","contracts":1,"entryPrice":2.5,"totalCost":250,"underlyingPrice":763.34,"targetStrike":762.34,"clientOrderId":"054a89d5a7a640818c828301647b4880"}
 {"ts":"2026-10-22T16:05:32.910Z","event":"exit_filled","optionSymbol":"SPY261022C00762000","reason":"profit_lock","contracts":1,"entryPrice":2.5,"exitPrice":3.06,"realizedPnl":56,"pctReturn":22.4}
+{"ts":"2026-10-23T03:37:37.782Z","event":"skipped","reason":"already_entered_today","detail":"already traded SPY261022C00762000 today"}
