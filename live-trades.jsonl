@@ -18,3 +18,4 @@
 {"ts":"2026-10-28T19:30:14.468Z","event":"exit_filled","optionSymbol":"SPY261028C00770000","reason":"eod","contracts":1,"entryPrice":2.76,"exitPrice":1.67,"realizedPnl":-109,"pctReturn":-39.49}
 {"ts":"2026-10-29T14:30:27.599Z","event":"entry_filled","optionSymbol":"SPY261029C00768000","strike":768,"expiration":"2026-10-29","contracts":1,"entryPrice":2.6,"totalCost":260,"underlyingPrice":769.38,"targetStrike":768.38,"clientOrderId":"d2a9274c73a14123bfe39adcde888fb8"}
 {"ts":"2026-10-29T17:35:51.228Z","event":"exit_filled","optionSymbol":"SPY261029C00768000","reason":"stop_loss","contracts":1,"entryPrice":2.6,"exitPrice":1.27,"realizedPnl":-133,"pctReturn":-51.15}
+{"ts":"2026-10-30T14:30:17.755Z","event":"skipped","reason":"insufficient_buying_power","detail":"need up to $363 (1x SPY261030C00757000, worst case 50% over ask $2.42), have $244 option buying power"}
