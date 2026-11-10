@@ -3,10 +3,13 @@
  * snapshot (spy-state.json). Same convention as the sibling projects: the
  * log is never rewritten or truncated, only appended to.
  *
- * spy-state.json is only used for one decision — "did we already enter
- * today?" — so a same-day re-dispatch of the workflow can't buy a second
- * time after the first position was already stopped out. Whether a
- * position is open right now always comes from the broker, never from here.
+ * spy-state.json tracks one sub-object per trading "slot" (2026-11-09: added
+ * a second slot, `midday`, so up to two independent same-day entries can be
+ * tracked without colliding — see main.ts's `SPY_SLOTS`). Each slot's own
+ * `entered` flag is what stops a same-day re-dispatch of the workflow from
+ * buying a second time for that slot after it was already stopped out.
+ * Whether a position is open right now always comes from the broker, never
+ * from here.
  *
  * File prefix is configurable (2026-10-16, for live trading): `LOG_PREFIX`
  * defaults to `spy` (the existing paper files, unchanged), but the live
@@ -25,6 +28,7 @@ const STATE_PATH = path.join(__dirname, `${PREFIX}-state.json`);
 export type SpyEvent =
   | {
       event: "entry_filled";
+      slot: string;
       optionSymbol: string;
       strike: number;
       expiration: string;
@@ -39,6 +43,7 @@ export type SpyEvent =
     }
   | {
       event: "exit_filled";
+      slot: string;
       optionSymbol: string;
       reason: "stop_loss" | "profit_lock" | "eod" ;
       contracts: number;
@@ -49,6 +54,7 @@ export type SpyEvent =
     }
   | {
       event: "resumed";
+      slot: string;
       optionSymbol: string;
       contracts: number;
       entryPrice: number;
@@ -56,16 +62,29 @@ export type SpyEvent =
     }
   | {
       event: "position_gone";
+      slot: string;
       optionSymbol: string;
       detail: string;
     }
   | {
       event: "skipped";
-      reason: "holiday" | "already_entered_today" | "past_entry_window" | "no_0dte_contract" | "no_quote" | "no_price" | "order_not_filled" | "insufficient_buying_power";
+      slot: string;
+      reason:
+        | "holiday"
+        | "already_entered_today"
+        | "past_entry_window"
+        | "no_0dte_contract"
+        | "no_quote"
+        | "no_price"
+        | "order_not_filled"
+        | "insufficient_buying_power"
+        | "strike_collision"
+        | "daily_risk_limit";
       detail: string;
     }
   | {
       event: "exit_failed";
+      slot: string;
       optionSymbol: string;
       reason: "stop_loss" | "profit_lock" | "eod";
       detail: string;
@@ -77,8 +96,7 @@ export function logEvent(e: SpyEvent): void {
   console.log(`[event] ${line}`);
 }
 
-export interface DayState {
-  date: string; // NY date
+export interface SlotState {
   entered: boolean;
   optionSymbol?: string;
   strike?: number;
@@ -89,14 +107,42 @@ export interface DayState {
   realizedPnl?: number;
 }
 
-export function readState(): DayState | null {
-  try {
-    return JSON.parse(fs.readFileSync(STATE_PATH, "utf8")) as DayState;
-  } catch {
-    return null;
-  }
+export interface DayState {
+  date: string; // NY date
+  slots: Record<string, SlotState>;
 }
 
-export function writeState(s: DayState): void {
+/** Today's state, or a fresh empty one if there's no file yet, it's
+ * unreadable, or it's a stale prior day's — callers never need to check the
+ * date themselves. */
+export function readDayState(today: string): DayState {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(STATE_PATH, "utf8")) as DayState;
+    if (parsed.date === today && parsed.slots) return parsed;
+  } catch {
+    // no file yet, or unreadable — treated the same as "nothing yet today"
+  }
+  return { date: today, slots: {} };
+}
+
+function writeDayState(s: DayState): void {
   fs.writeFileSync(STATE_PATH, JSON.stringify(s, null, 2) + "\n");
+}
+
+/** Slots run concurrently in the same process (see main.ts's
+ * `Promise.all` over `runSlotSession`) and can genuinely finish at the same
+ * wall-clock moment — both slots' EOD exit fires at the identical NY minute
+ * every single day, for instance. Without serializing, two concurrent
+ * read-modify-write calls here could race and silently drop one slot's
+ * update. Node is single-threaded, so chaining onto one shared promise is
+ * enough to make every read-modify-write atomic relative to the others —
+ * no real lock needed. */
+let writeQueue: Promise<unknown> = Promise.resolve();
+export function updateSlotState(today: string, slotId: string, patch: Partial<SlotState>): Promise<void> {
+  writeQueue = writeQueue.then(() => {
+    const state = readDayState(today);
+    state.slots[slotId] = { ...(state.slots[slotId] ?? { entered: false }), ...patch };
+    writeDayState(state);
+  });
+  return writeQueue as Promise<void>;
 }

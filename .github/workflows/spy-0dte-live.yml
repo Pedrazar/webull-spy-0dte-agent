@@ -61,6 +61,10 @@ jobs:
           SPY_CONTRACTS: "1"
           SPY_STRIKE_OFFSET: "1"
           SPY_STOP_LOSS_PCT: "0.50"
+          # 2026-11-09: paper now also trades a 12:30pm ET slot (see
+          # spy-0dte.yml) -- live stays morning-only for now, pinned
+          # explicitly here rather than relying on main.ts's default.
+          SPY_SLOTS: "morning"
         run: npx tsx liveMain.ts
 
       - name: Push refreshed prod token back to Secrets (only if it changed)

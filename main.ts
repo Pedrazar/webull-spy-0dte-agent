@@ -1,14 +1,27 @@
 /**
- * SPY 0DTE call agent — one long-running session per trading day.
+ * SPY 0DTE call agent — one long-running session per trading day, able to
+ * run more than one independent entry/exit cycle ("slot") within that same
+ * session (2026-11-09: added a second slot, `midday`, at 12:30pm ET — see
+ * `SPY_SLOTS` below). Each slot behaves exactly like the original
+ * single-trade design:
  *
- * Strategy:
- *   - At 10:30am ET (one hour after the open), read SPY's price and buy
- *     SPY_CONTRACTS of the same-day-expiring CALL whose strike is nearest to
+ *   - At its entry time, read SPY's price and buy SPY_CONTRACTS of the
+ *     same-day-expiring CALL whose strike is nearest to
  *     (price - SPY_STRIKE_OFFSET), i.e. ~$1 in the money.
  *   - Watch it every POLL_MS. Close it if its mid price falls to
- *     (1 - SPY_STOP_LOSS_PCT) x the entry price (50% loss), or at 15
- *     minutes before the close (3:45pm ET; 12:45pm on half-days), whichever
- *     comes first. At most one entry per day.
+ *     (1 - SPY_STOP_LOSS_PCT) x the entry price (50% loss), on a profit-lock
+ *     trailing-stop pullback once armed, or at EXIT_BEFORE_CLOSE_MIN minutes
+ *     before the close, whichever comes first. At most one entry per slot
+ *     per day.
+ *
+ * Slots run concurrently (Promise.all), not sequentially — a later slot
+ * does NOT wait for an earlier one to close. Two safety rules keep that
+ * from causing cross-slot damage:
+ *   - A slot never enters a strike another still-open slot already holds
+ *     (the broker can't tell two same-strike lots apart — see `enter()`).
+ *   - A slot skips its entry entirely if the day's already-realized P&L
+ *     (summed across slots that already closed) is at or below
+ *     -SPY_DAILY_RISK_LIMIT — see `runSlotSession()`.
  *
  * The stop is client-side (this loop), not a resting broker STOP order:
  * option STOP orders have never been verified live against this sandbox,
@@ -35,7 +48,7 @@ import {
   Position,
 } from "./optionsClient";
 import { isMarketHoliday, nyMinutesOf, marketCloseMinutes, todayNyDate } from "./marketHours";
-import { logEvent, readState, writeState, DayState } from "./tradeLogger";
+import { logEvent, readDayState, updateSlotState } from "./tradeLogger";
 
 const SYMBOL = "SPY";
 const CONTRACTS = parseInt(process.env.SPY_CONTRACTS ?? "1", 10);
@@ -55,6 +68,8 @@ const PROFIT_LOCK_TRAIL_PCT = parseFloat(process.env.SPY_PROFIT_LOCK_TRAIL_PCT ?
 
 const ENTRY_MIN = 10 * 60 + 30; // 10:30am ET
 const ENTRY_DEADLINE_MIN = 11 * 60; // don't enter late if the session started late
+const MIDDAY_ENTRY_MIN = 12 * 60 + 30; // 12:30pm ET
+const MIDDAY_ENTRY_DEADLINE_MIN = 13 * 60;
 // 2026-10-21: moved from 15 to 30 minutes before close (3:45pm -> 3:30pm
 // ET). CONFIRMED via a real Webull "Forced Liquidation Warning" that day,
 // triggered by the live account's own open position: Webull liquidates an
@@ -71,8 +86,40 @@ const ENTRY_DEADLINE_MIN = 11 * 60; // don't enter late if the session started l
 const EXIT_BEFORE_CLOSE_MIN = parseInt(process.env.SPY_EXIT_BEFORE_CLOSE_MIN ?? "30", 10); // 3:30pm ET on a normal day
 /** On Actions, a session started before this can't reach the EOD exit
  * inside the 6-hour runner cap (10:10 -> 15:30 is 320 min + setup — even
- * more margin now that EOD moved from 3:45 to 3:30). */
+ * more margin now that EOD moved from 3:45 to 3:30). Unaffected by adding
+ * the midday slot: slots run concurrently, so the session's total wall-clock
+ * length is still bounded by the EOD exit, not by how many slots there are. */
 const EARLIEST_ACTIONS_START_MIN = 10 * 60 + 10;
+/** 2026-11-09: added alongside the midday slot. If today's already-realized
+ * P&L (summed across slots that have already closed) is at or below minus
+ * this, a later slot skips its entry entirely rather than risking a second
+ * loss on top of an already-bad day. User's explicit dollar figure, not
+ * derived from anything else — a single max stop-loss on one ~$400 contract
+ * is already close to this, so in practice this mostly blocks the 2nd trade
+ * after a full stop-out, not after a small EOD loss. */
+const DAILY_RISK_LIMIT = parseFloat(process.env.SPY_DAILY_RISK_LIMIT ?? "250");
+
+interface Slot {
+  id: string;
+  entryMin: number;
+  entryDeadlineMin: number;
+}
+const ALL_SLOTS: Record<string, Slot> = {
+  morning: { id: "morning", entryMin: ENTRY_MIN, entryDeadlineMin: ENTRY_DEADLINE_MIN },
+  midday: { id: "midday", entryMin: MIDDAY_ENTRY_MIN, entryDeadlineMin: MIDDAY_ENTRY_DEADLINE_MIN },
+};
+/** Which slots this session runs. Defaults to just `morning` — i.e. the
+ * original single-trade-a-day behavior — so anything that doesn't
+ * explicitly opt in (the live workflow, as of 2026-11-09) is unaffected.
+ * The paper workflow opts into `morning,midday`. */
+function activeSlots(): Slot[] {
+  const ids = (process.env.SPY_SLOTS ?? "morning").split(",").map((s) => s.trim()).filter(Boolean);
+  return ids.map((id) => {
+    const slot = ALL_SLOTS[id];
+    if (!slot) throw new Error(`Unknown SPY_SLOTS entry "${id}" — expected one of ${Object.keys(ALL_SLOTS).join(", ")}`);
+    return slot;
+  });
+}
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -195,7 +242,15 @@ interface HeldCall {
  * mixed into the same proceeds/sold accounting as the real exit. A real,
  * unauthorized sale of a position this code had no business touching, not
  * just a bookkeeping error. This account can never be assumed dedicated
- * again, in code or in judgment. */
+ * again, in code or in judgment.
+ *
+ * 2026-11-09: with two slots able to hold positions at once, an exact
+ * strike match is no longer enough to guarantee "this is MY slot's
+ * position" — if both slots ever targeted the identical strike, the
+ * broker would show ONE combined position for both lots, indistinguishable
+ * here. `enter()` avoids that case entirely (see its `avoidStrikes` param)
+ * rather than trying to disambiguate lots within a single broker position,
+ * which the API has no way to express. */
 async function findHeldCall(client: WebullClient, accountId: string, expectedStrike: number): Promise<HeldCall | null> {
   const today = todayNyDate();
   const positions: Position[] = await getPositions(client, accountId);
@@ -320,11 +375,15 @@ async function settleOrder(client: WebullClient, accountId: string, clientOrderI
 // Entry
 // ---------------------------------------------------------------------------
 
-async function enter(client: WebullClient, accountId: string): Promise<HeldCall | null> {
+/** @param avoidStrikes strikes another still-open slot already holds today
+ * — entering any of these would merge two slots' lots into one
+ * indistinguishable broker position (see findHeldCall()'s 2026-11-09 note),
+ * so this slot skips its entry entirely rather than risking that. */
+async function enter(client: WebullClient, accountId: string, slotId: string, avoidStrikes: number[]): Promise<HeldCall | null> {
   const today = todayNyDate();
   const price = await fetchSpyPrice(client);
   if (price === null) {
-    logEvent({ event: "skipped", reason: "no_price", detail: "SPY bars lookup returned nothing" });
+    logEvent({ event: "skipped", slot: slotId, reason: "no_price", detail: "SPY bars lookup returned nothing" });
     return null;
   }
   const target = round2(price - STRIKE_OFFSET);
@@ -341,11 +400,21 @@ async function enter(client: WebullClient, accountId: string): Promise<HeldCall 
   ).filter((c) => c.expiration_date === today);
   const contract = pickStrikeNearest(chain, target);
   if (!contract) {
-    logEvent({ event: "skipped", reason: "no_0dte_contract", detail: `no SPY CALL expiring ${today} near strike ${target}` });
+    logEvent({ event: "skipped", slot: slotId, reason: "no_0dte_contract", detail: `no SPY CALL expiring ${today} near strike ${target}` });
     return null;
   }
   const strike = parseFloat(contract.strike_price);
-  console.log(`[decision] SPY ${price} - ${STRIKE_OFFSET} = target ${target} -> ${contract.symbol} (strike ${strike})`);
+  console.log(`[${slotId}] [decision] SPY ${price} - ${STRIKE_OFFSET} = target ${target} -> ${contract.symbol} (strike ${strike})`);
+
+  if (avoidStrikes.includes(strike)) {
+    logEvent({
+      event: "skipped",
+      slot: slotId,
+      reason: "strike_collision",
+      detail: `target strike ${strike} is already held by another slot today — the broker can't distinguish a second lot at the same strike, so skipping rather than merging positions`,
+    });
+    return null;
+  }
 
   // Buying-power guard — added 2026-10-16 for live trading. Sandbox's
   // ~$1M paper buying power never made this a real constraint, but a real
@@ -365,12 +434,13 @@ async function enter(client: WebullClient, accountId: string): Promise<HeldCall 
     if (buyingPower !== null && buyingPower < worstCaseCost) {
       logEvent({
         event: "skipped",
+        slot: slotId,
         reason: "insufficient_buying_power",
         detail: `need up to $${worstCaseCost} (${CONTRACTS}x ${contract.symbol}, worst case 50% over ask $${precheckQuote.ask}), have $${buyingPower} option buying power`,
       });
       return null;
     }
-    console.log(`[guard] buying power ${buyingPower ?? "unknown"} >= worst-case cost ${worstCaseCost}, proceeding`);
+    console.log(`[${slotId}] [guard] buying power ${buyingPower ?? "unknown"} >= worst-case cost ${worstCaseCost}, proceeding`);
   }
 
   // Buy at an escalating premium over the ask if earlier attempts don't
@@ -384,11 +454,11 @@ async function enter(client: WebullClient, accountId: string): Promise<HeldCall 
   for (let attempt = 1; attempt <= 5; attempt++) {
     const q = await quote(client, contract.symbol);
     if (!q) {
-      logEvent({ event: "skipped", reason: "no_quote", detail: `no usable bid/ask for ${contract.symbol}` });
+      logEvent({ event: "skipped", slot: slotId, reason: "no_quote", detail: `no usable bid/ask for ${contract.symbol}` });
       return null;
     }
     const limitPrice = round2(q.ask * (1 + escalatingDiscount(attempt)));
-    console.log(`[quote] ${contract.symbol} bid ${q.bid} ask ${q.ask} last ${q.lastPrice} delay_minutes ${q.delayMinutes}`);
+    console.log(`[${slotId}] [quote] ${contract.symbol} bid ${q.bid} ask ${q.ask} last ${q.lastPrice} delay_minutes ${q.delayMinutes}`);
     const res = await placeOptionOrder(client, accountId, {
       underlyingSymbol: SYMBOL,
       optionSymbol: contract.symbol,
@@ -402,9 +472,9 @@ async function enter(client: WebullClient, accountId: string): Promise<HeldCall 
     });
     const clientOrderId = (res.client_order_id as string) ?? "";
     const s = await settleOrder(client, accountId, clientOrderId, 10_000);
-    console.log(`[order] BUY_TO_OPEN attempt ${attempt} @ ${limitPrice} (ask ${q.ask} +${(escalatingDiscount(attempt) * 100).toFixed(0)}%): ${s.status}, filled ${s.filledQuantity}`);
+    console.log(`[${slotId}] [order] BUY_TO_OPEN attempt ${attempt} @ ${limitPrice} (ask ${q.ask} +${(escalatingDiscount(attempt) * 100).toFixed(0)}%): ${s.status}, filled ${s.filledQuantity}`);
     const qAfter = await quote(client, contract.symbol);
-    if (qAfter) console.log(`[quote] ${contract.symbol} AFTER settle: bid ${qAfter.bid} ask ${qAfter.ask} last ${qAfter.lastPrice} (was ask ${q.ask} at order time)`);
+    if (qAfter) console.log(`[${slotId}] [quote] ${contract.symbol} AFTER settle: bid ${qAfter.bid} ask ${qAfter.ask} last ${qAfter.lastPrice} (was ask ${q.ask} at order time)`);
 
     // Broker positions decide what we actually hold (partial fills, or an
     // UNKNOWN settle, both land here correctly).
@@ -414,6 +484,7 @@ async function enter(client: WebullClient, accountId: string): Promise<HeldCall 
       held.costPrice = entryPrice;
       logEvent({
         event: "entry_filled",
+        slot: slotId,
         optionSymbol: held.optionSymbol,
         strike: held.strike,
         expiration: today,
@@ -428,7 +499,7 @@ async function enter(client: WebullClient, accountId: string): Promise<HeldCall 
     }
     if (s.status === "UNKNOWN") break; // don't stack a second order on an unsettled one
   }
-  logEvent({ event: "skipped", reason: "order_not_filled", detail: `BUY_TO_OPEN ${contract.symbol} never filled` });
+  logEvent({ event: "skipped", slot: slotId, reason: "order_not_filled", detail: `BUY_TO_OPEN ${contract.symbol} never filled` });
   return null;
 }
 
@@ -443,6 +514,8 @@ async function exitPosition(
   client: WebullClient,
   accountId: string,
   held: HeldCall,
+  slotId: string,
+  today: string,
   reason: "stop_loss" | "profit_lock" | "eod",
   giveUpAtMin: number
 ): Promise<boolean> {
@@ -467,7 +540,7 @@ async function exitPosition(
       if (!current) break;
       const q = await quote(client, current.optionSymbol);
       if (!q) {
-        console.warn(`[exit] no quote for ${current.optionSymbol}, retrying`);
+        console.warn(`[${slotId}] [exit] no quote for ${current.optionSymbol}, retrying`);
         await sleep(5000);
         continue;
       }
@@ -482,7 +555,7 @@ async function exitPosition(
       // means far more attempts fit in the same giveUpAtMin budget, each
       // one meaningfully more aggressive than the last.
       const limit = Math.max(0.01, round2(q.bid * (1 - escalatingDiscount(attempt))));
-      console.log(`[quote] ${current.optionSymbol} bid ${q.bid} ask ${q.ask} last ${q.lastPrice} delay_minutes ${q.delayMinutes}`);
+      console.log(`[${slotId}] [quote] ${current.optionSymbol} bid ${q.bid} ask ${q.ask} last ${q.lastPrice} delay_minutes ${q.delayMinutes}`);
       const res = await placeOptionOrder(client, accountId, {
         underlyingSymbol: SYMBOL,
         optionSymbol: current.optionSymbol,
@@ -495,16 +568,16 @@ async function exitPosition(
         positionIntent: "SELL_TO_CLOSE",
       });
       const s = await settleOrder(client, accountId, (res.client_order_id as string) ?? "", 10_000);
-      console.log(`[exit] SELL_TO_CLOSE attempt ${attempt} @ ${limit} (bid ${q.bid} -${(escalatingDiscount(attempt) * 100).toFixed(0)}%) (${reason}): ${s.status}, filled ${s.filledQuantity}`);
+      console.log(`[${slotId}] [exit] SELL_TO_CLOSE attempt ${attempt} @ ${limit} (bid ${q.bid} -${(escalatingDiscount(attempt) * 100).toFixed(0)}%) (${reason}): ${s.status}, filled ${s.filledQuantity}`);
       const qAfter = await quote(client, current.optionSymbol);
-      if (qAfter) console.log(`[quote] ${current.optionSymbol} AFTER settle: bid ${qAfter.bid} ask ${qAfter.ask} last ${qAfter.lastPrice} (was bid ${q.bid} at order time)`);
+      if (qAfter) console.log(`[${slotId}] [quote] ${current.optionSymbol} AFTER settle: bid ${qAfter.bid} ask ${qAfter.ask} last ${qAfter.lastPrice} (was bid ${q.bid} at order time)`);
       if (s.filledQuantity > 0) {
         proceeds += (s.filledPrice ?? limit) * s.filledQuantity;
         sold += s.filledQuantity;
       }
       if (s.status === "UNKNOWN") await sleep(10_000); // let it settle before re-checking positions
     } catch (err) {
-      console.warn(`[exit] attempt ${attempt} hit a transient error, will retry:`, err);
+      console.warn(`[${slotId}] [exit] attempt ${attempt} hit a transient error, will retry:`, err);
       await sleep(5000);
     }
   }
@@ -529,12 +602,13 @@ async function exitPosition(
   // or silently assuming either outcome.
   if (sold < held.contracts) {
     const stillHeld = await findHeldCall(client, accountId, held.strike).catch((err) => {
-      console.warn("[exit] final position check failed, state is genuinely unknown:", err);
+      console.warn(`[${slotId}] [exit] final position check failed, state is genuinely unknown:`, err);
       return "unknown" as const;
     });
     if (stillHeld === "unknown" || stillHeld) {
       logEvent({
         event: "exit_failed",
+        slot: slotId,
         optionSymbol: held.optionSymbol,
         reason,
         detail:
@@ -550,6 +624,7 @@ async function exitPosition(
   const realizedPnl = round2((exitPrice - held.costPrice) * held.contracts * 100);
   logEvent({
     event: "exit_filled",
+    slot: slotId,
     optionSymbol: held.optionSymbol,
     reason,
     contracts: held.contracts,
@@ -558,8 +633,7 @@ async function exitPosition(
     realizedPnl,
     pctReturn: round2(((exitPrice - held.costPrice) / held.costPrice) * 100),
   });
-  const state = readState();
-  if (state) writeState({ ...state, exitPrice, exitReason: reason, realizedPnl });
+  await updateSlotState(today, slotId, { exitPrice, exitReason: reason, realizedPnl });
   return true;
 }
 
@@ -567,13 +641,13 @@ async function exitPosition(
 // Session
 // ---------------------------------------------------------------------------
 
-async function monitor(client: WebullClient, accountId: string, held: HeldCall): Promise<boolean> {
+async function monitor(client: WebullClient, accountId: string, held: HeldCall, slotId: string, today: string): Promise<boolean> {
   const closeMin = marketCloseMinutes();
   const exitMin = closeMin - EXIT_BEFORE_CLOSE_MIN;
   const stopPrice = round2(held.costPrice * (1 - STOP_LOSS_PCT));
   const armPrice = round2(held.costPrice * (1 + PROFIT_LOCK_ARM_PCT));
   console.log(
-    `[monitor] ${held.optionSymbol} x${held.contracts} entry ${held.costPrice}, stop at mid <= ${stopPrice}, EOD exit ${hhmm(exitMin)} ET, profit-lock arms at mid >= ${armPrice} (${(PROFIT_LOCK_TRAIL_PCT * 100).toFixed(0)}% trail off peak once armed)`
+    `[${slotId}] [monitor] ${held.optionSymbol} x${held.contracts} entry ${held.costPrice}, stop at mid <= ${stopPrice}, EOD exit ${hhmm(exitMin)} ET, profit-lock arms at mid >= ${armPrice} (${(PROFIT_LOCK_TRAIL_PCT * 100).toFixed(0)}% trail off peak once armed)`
   );
 
   let lastLog = 0;
@@ -582,30 +656,30 @@ async function monitor(client: WebullClient, accountId: string, held: HeldCall):
   let armed = false;
   for (;;) {
     if (nyMinutesOf(new Date()) >= exitMin) {
-      return exitPosition(client, accountId, held, "eod", closeMin - 1);
+      return exitPosition(client, accountId, held, slotId, today, "eod", closeMin - 1);
     }
     const q = await quote(client, held.optionSymbol);
     if (q && q.mid <= stopPrice) {
-      console.log(`[monitor] STOP: mid ${q.mid} <= ${stopPrice}`);
-      return exitPosition(client, accountId, held, "stop_loss", closeMin - 1);
+      console.log(`[${slotId}] [monitor] STOP: mid ${q.mid} <= ${stopPrice}`);
+      return exitPosition(client, accountId, held, slotId, today, "stop_loss", closeMin - 1);
     }
     if (q) {
       if (q.mid > peakMid) peakMid = q.mid;
       if (!armed && peakMid >= armPrice) {
         armed = true;
-        console.log(`[monitor] profit-lock ARMED: peak ${peakMid} >= ${armPrice}`);
+        console.log(`[${slotId}] [monitor] profit-lock ARMED: peak ${peakMid} >= ${armPrice}`);
       }
       if (armed) {
         const trailStop = round2(peakMid * (1 - PROFIT_LOCK_TRAIL_PCT));
         if (q.mid <= trailStop) {
-          console.log(`[monitor] PROFIT-LOCK: mid ${q.mid} <= ${trailStop} (${(PROFIT_LOCK_TRAIL_PCT * 100).toFixed(0)}% off peak ${peakMid})`);
-          return exitPosition(client, accountId, held, "profit_lock", closeMin - 1);
+          console.log(`[${slotId}] [monitor] PROFIT-LOCK: mid ${q.mid} <= ${trailStop} (${(PROFIT_LOCK_TRAIL_PCT * 100).toFixed(0)}% off peak ${peakMid})`);
+          return exitPosition(client, accountId, held, slotId, today, "profit_lock", closeMin - 1);
         }
       }
     }
     if (Date.now() - lastLog >= 60_000) {
       const pnl = q ? round2((q.mid - held.costPrice) * held.contracts * 100) : null;
-      console.log(`[monitor] bid ${q?.bid ?? "-"} ask ${q?.ask ?? "-"} mid ${q?.mid ?? "-"} | unrealized ${pnl ?? "?"} | peak ${peakMid}${armed ? " (armed)" : ""}`);
+      console.log(`[${slotId}] [monitor] bid ${q?.bid ?? "-"} ask ${q?.ask ?? "-"} mid ${q?.mid ?? "-"} | unrealized ${pnl ?? "?"} | peak ${peakMid}${armed ? " (armed)" : ""}`);
       lastLog = Date.now();
     }
     // Every 5 minutes, confirm with the broker that we still hold it (it
@@ -613,12 +687,86 @@ async function monitor(client: WebullClient, accountId: string, held: HeldCall):
     if (Date.now() - lastReconcile >= 300_000) {
       lastReconcile = Date.now();
       if (!(await findHeldCall(client, accountId, held.strike))) {
-        logEvent({ event: "position_gone", optionSymbol: held.optionSymbol, detail: "broker no longer shows the position (closed outside this agent?)" });
+        logEvent({ event: "position_gone", slot: slotId, optionSymbol: held.optionSymbol, detail: "broker no longer shows the position (closed outside this agent?)" });
         return true;
       }
     }
     await sleep(POLL_MS);
   }
+}
+
+/** One slot's full lifecycle: resume-or-wait-for-entry, entry, monitor/exit.
+ * Runs concurrently with any other active slot in the same process (see
+ * `runSession()`'s `Promise.all`) — see the file header for the two
+ * cross-slot safety rules this depends on. */
+async function runSlotSession(client: WebullClient, accountId: string, slot: Slot, today: string): Promise<boolean> {
+  // Resume first: a position we already hold for THIS slot (e.g. after a
+  // crashed/re-run job) is always managed, whatever the clock says. BUT
+  // only by checking today's own remembered strike for this slot (from a
+  // previous successful entry_filled write) — never by scanning for "any
+  // SPY call", per the 2026-10-20 finding in findHeldCall()'s own comment:
+  // this account holds other SPY positions that are genuinely none of this
+  // agent's business. If the state file itself is missing/stale (e.g. a
+  // crash before it could ever be written), there is nothing safe to
+  // resume — proceed to the normal entry flow instead of guessing at a
+  // strike.
+  const state = readDayState(today);
+  const slotState = state.slots[slot.id];
+  if (slotState?.entered) {
+    if (slotState.optionSymbol && slotState.strike !== undefined) {
+      const existing = await findHeldCall(client, accountId, slotState.strike);
+      if (existing) {
+        if (slotState.entryPrice) existing.costPrice = slotState.entryPrice;
+        logEvent({ event: "resumed", slot: slot.id, optionSymbol: existing.optionSymbol, contracts: existing.contracts, entryPrice: existing.costPrice, detail: `found today's own ${slot.id} 0DTE call still open at startup` });
+        return monitor(client, accountId, existing, slot.id, today);
+      }
+      // State says we entered but the broker no longer shows that exact
+      // strike — already closed (by this agent earlier, or by hand).
+      // Nothing to resume; fall through to "already_entered_today" below.
+    }
+    logEvent({ event: "skipped", slot: slot.id, reason: "already_entered_today", detail: `already traded ${slotState.optionSymbol} today (${slot.id})` });
+    return true;
+  }
+
+  for (;;) {
+    const min = nyMinutesOf(new Date());
+    if (min >= slot.entryMin) break;
+    console.log(`[${slot.id}] [session] waiting for ${hhmm(slot.entryMin)} ET entry (now ${hhmm(min)})`);
+    await sleep(Math.min(60_000, (slot.entryMin - min) * 60_000));
+  }
+  if (nyMinutesOf(new Date()) >= slot.entryDeadlineMin) {
+    logEvent({ event: "skipped", slot: slot.id, reason: "past_entry_window", detail: `${slot.id} session reached entry at ${hhmm(nyMinutesOf(new Date()))} ET, after the ${hhmm(slot.entryDeadlineMin)} cutoff` });
+    return true;
+  }
+
+  // Daily risk limit (2026-11-09, user's call): if other slots that
+  // already closed today are, combined, down more than this, don't risk a
+  // second loss on top of it. Only ever matters for a slot entering later
+  // than another — the very first slot of the day always sees $0 realized
+  // so far and this is a no-op for it.
+  const freshState = readDayState(today);
+  const realizedToday = Object.values(freshState.slots).reduce((sum, s) => sum + (s.realizedPnl ?? 0), 0);
+  if (realizedToday <= -DAILY_RISK_LIMIT) {
+    logEvent({
+      event: "skipped",
+      slot: slot.id,
+      reason: "daily_risk_limit",
+      detail: `today's realized P&L across already-closed slots is $${round2(realizedToday)} (<= -$${DAILY_RISK_LIMIT} limit) — skipping ${slot.id} entry`,
+    });
+    return true;
+  }
+
+  // Strike-collision guard (2026-11-09): don't enter a strike another
+  // still-open slot already holds — see enter()'s doc comment and
+  // findHeldCall()'s 2026-11-09 note for why.
+  const avoidStrikes = Object.entries(freshState.slots)
+    .filter(([id, s]) => id !== slot.id && s.entered && s.strike !== undefined && s.exitPrice === undefined)
+    .map(([, s]) => s.strike as number);
+
+  const held = await enter(client, accountId, slot.id, avoidStrikes);
+  if (!held) return true;
+  await updateSlotState(today, slot.id, { entered: true, optionSymbol: held.optionSymbol, strike: held.strike, contracts: held.contracts, entryPrice: held.costPrice });
+  return monitor(client, accountId, held, slot.id, today);
 }
 
 export async function runSession(client: WebullClient, accountId: string): Promise<boolean> {
@@ -634,48 +782,9 @@ export async function runSession(client: WebullClient, accountId: string): Promi
     );
   }
 
-  // Resume first: a position we already hold (e.g. after a crashed/re-run
-  // job) is always managed, whatever the clock says. BUT only by checking
-  // today's own remembered strike (from a previous successful entry_filled
-  // write) — never by scanning for "any SPY call", per the 2026-10-20
-  // finding in findHeldCall()'s own comment: this account holds other SPY
-  // positions that are genuinely none of this agent's business. If the
-  // state file itself is missing/stale (e.g. a crash before it could ever
-  // be written), there is nothing safe to resume — proceed to the normal
-  // entry flow instead of guessing at a strike.
-  const state = readState();
-  if (state?.date === today && state.entered) {
-    if (state.optionSymbol && state.strike !== undefined) {
-      const existing = await findHeldCall(client, accountId, state.strike);
-      if (existing) {
-        if (state.entryPrice) existing.costPrice = state.entryPrice;
-        logEvent({ event: "resumed", optionSymbol: existing.optionSymbol, contracts: existing.contracts, entryPrice: existing.costPrice, detail: "found today's own 0DTE call still open at startup" });
-        return monitor(client, accountId, existing);
-      }
-      // State says we entered but the broker no longer shows that exact
-      // strike — already closed (by this agent earlier, or by hand).
-      // Nothing to resume; fall through to "already_entered_today" below.
-    }
-    logEvent({ event: "skipped", reason: "already_entered_today", detail: `already traded ${state.optionSymbol} today` });
-    return true;
-  }
-
-  for (;;) {
-    const min = nyMinutesOf(new Date());
-    if (min >= ENTRY_MIN) break;
-    console.log(`[session] waiting for ${hhmm(ENTRY_MIN)} ET entry (now ${hhmm(min)})`);
-    await sleep(Math.min(60_000, (ENTRY_MIN - min) * 60_000));
-  }
-  if (nyMinutesOf(new Date()) >= ENTRY_DEADLINE_MIN) {
-    logEvent({ event: "skipped", reason: "past_entry_window", detail: `session reached entry at ${hhmm(nyMinutesOf(new Date()))} ET, after the ${hhmm(ENTRY_DEADLINE_MIN)} cutoff` });
-    return true;
-  }
-
-  const held = await enter(client, accountId);
-  if (!held) return true;
-  const entered: DayState = { date: today, entered: true, optionSymbol: held.optionSymbol, strike: held.strike, contracts: held.contracts, entryPrice: held.costPrice };
-  writeState(entered);
-  return monitor(client, accountId, held);
+  const slots = activeSlots();
+  const results = await Promise.all(slots.map((slot) => runSlotSession(client, accountId, slot, today)));
+  return results.every(Boolean);
 }
 
 async function main() {
