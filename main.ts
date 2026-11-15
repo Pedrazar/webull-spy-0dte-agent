@@ -49,6 +49,7 @@ import {
 } from "./optionsClient";
 import { isMarketHoliday, nyMinutesOf, marketCloseMinutes, todayNyDate } from "./marketHours";
 import { logEvent, readDayState, updateSlotState } from "./tradeLogger";
+import { supervisorPause } from "./supervisorControl";
 
 const SYMBOL = "SPY";
 const CONTRACTS = parseInt(process.env.SPY_CONTRACTS ?? "1", 10);
@@ -381,6 +382,16 @@ async function settleOrder(client: WebullClient, accountId: string, clientOrderI
  * so this slot skips its entry entirely rather than risking that. */
 async function enter(client: WebullClient, accountId: string, slotId: string, avoidStrikes: number[]): Promise<HeldCall | null> {
   const today = todayNyDate();
+  // Supervisor pause switch (webull-supervisor control.json), PAPER ONLY:
+  // the live workflow (SPY_LOG_PREFIX=live) never consults it. Blocks NEW
+  // entries only; an open position is always managed and closed as usual.
+  if ((process.env.SPY_LOG_PREFIX ?? "spy") !== "live") {
+    const pause = await supervisorPause("spy-0dte");
+    if (pause.paused) {
+      logEvent({ event: "skipped", slot: slotId, reason: "supervisor_paused", detail: pause.reason ?? "paused by supervisor" });
+      return null;
+    }
+  }
   const price = await fetchSpyPrice(client);
   if (price === null) {
     logEvent({ event: "skipped", slot: slotId, reason: "no_price", detail: "SPY bars lookup returned nothing" });
