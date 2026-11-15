@@ -79,7 +79,8 @@ export type SpyEvent =
         | "order_not_filled"
         | "insufficient_buying_power"
         | "strike_collision"
-        | "daily_risk_limit";
+        | "daily_risk_limit"
+        | "supervisor_paused";
       detail: string;
     }
   | {

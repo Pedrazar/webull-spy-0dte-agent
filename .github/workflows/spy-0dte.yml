@@ -42,6 +42,7 @@ jobs:
           WEBULL_APP_SECRET: ${{ secrets.WEBULL_APP_SECRET }}
           WEBULL_BASE_URL: ${{ secrets.WEBULL_BASE_URL }}
           WEBULL_SANDBOX_ACCOUNT_ID: ${{ secrets.WEBULL_SANDBOX_ACCOUNT_ID }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # read-only use: webull-supervisor control.json (pause switch)
           SPY_CONTRACTS: "1"
           SPY_STRIKE_OFFSET: "1"
           SPY_STOP_LOSS_PCT: "0.50"
