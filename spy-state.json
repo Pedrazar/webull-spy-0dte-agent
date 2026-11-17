@@ -1,25 +1,25 @@
 {
-  "date": "2026-11-16",
+  "date": "2026-11-17",
   "slots": {
     "morning": {
       "entered": true,
-      "optionSymbol": "SPY261116C00743000",
-      "strike": 743,
+      "optionSymbol": "SPY261117C00736000",
+      "strike": 736,
       "contracts": 1,
-      "entryPrice": 2.83,
-      "exitPrice": 3.98,
-      "exitReason": "profit_lock",
-      "realizedPnl": 115
+      "entryPrice": 2.54,
+      "exitPrice": 1.27,
+      "exitReason": "stop_loss",
+      "realizedPnl": -127
     },
     "midday": {
       "entered": true,
-      "optionSymbol": "SPY261116C00743000",
-      "strike": 743,
+      "optionSymbol": "SPY261117C00732000",
+      "strike": 732,
       "contracts": 1,
-      "entryPrice": 1.65,
-      "exitPrice": 0.82,
+      "entryPrice": 3.22,
+      "exitPrice": 1.58,
       "exitReason": "stop_loss",
-      "realizedPnl": -83
+      "realizedPnl": -164
     }
   }
 }
