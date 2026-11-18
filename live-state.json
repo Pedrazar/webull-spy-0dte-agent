@@ -1,15 +1,15 @@
 {
-  "date": "2026-11-17",
+  "date": "2026-11-18",
   "slots": {
     "morning": {
       "entered": true,
-      "optionSymbol": "SPY261117C00736000",
-      "strike": 736,
+      "optionSymbol": "SPY261118C00731000",
+      "strike": 731,
       "contracts": 1,
-      "entryPrice": 2.55,
-      "exitPrice": 1.26,
+      "entryPrice": 3.1,
+      "exitPrice": 1.54,
       "exitReason": "stop_loss",
-      "realizedPnl": -129
+      "realizedPnl": -156
     }
   }
 }
