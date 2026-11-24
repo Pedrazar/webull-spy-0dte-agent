@@ -43,3 +43,4 @@
 {"ts":"2026-11-19T16:51:47.685Z","event":"exit_filled","slot":"morning","optionSymbol":"SPY261119C00730000","reason":"stop_loss","contracts":1,"entryPrice":3.45,"exitPrice":1.61,"realizedPnl":-184,"pctReturn":-53.33}
 {"ts":"2026-11-20T15:30:20.920Z","event":"skipped","slot":"morning","reason":"insufficient_buying_power","detail":"need up to $627 (1x SPY261120C00709000, worst case 50% over ask $4.18), have $313.91 option buying power"}
 {"ts":"2026-11-23T15:30:20.663Z","event":"skipped","slot":"morning","reason":"insufficient_buying_power","detail":"need up to $676.5 (1x SPY261123C00725000, worst case 50% over ask $4.51), have $287.98 option buying power"}
+{"ts":"2026-11-24T15:30:20.175Z","event":"skipped","slot":"morning","reason":"insufficient_buying_power","detail":"need up to $528 (1x SPY261124C00714000, worst case 50% over ask $3.52), have $385.7 option buying power"}
